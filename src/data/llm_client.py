@@ -2,7 +2,9 @@
 LLM Client for market analysis.
 """
 
+import json
 import os
+import re
 import requests
 from typing import Optional, List, Dict
 
@@ -54,6 +56,197 @@ class LLMClient:
 llm_client = LLMClient()
 
 
+# ─── VALID ENUMS (enforced by prompt + parser) ────────────────────────────────
+
+VALID_MACRO_REGIME = {"RISK_ON", "RISK_OFF", "NEUTRAL"}
+VALID_BTC_STRENGTH = {"STRONG", "WEAK", "NEUTRAL"}
+VALID_VOLATILITY  = {"HIGH", "LOW"}
+
+# ─── FALLBACK (returned on parse/network error) ──────────────────────────────
+
+FALLBACK_CONTEXT = {
+    "macro_regime":     "NEUTRAL",
+    "btc_strength":     "NEUTRAL",
+    "volatility_warning": "LOW",
+    "_error":          None,
+    "_block_reason":   None,
+}
+
+
+def _norm(v: str) -> str:
+    """Normalize and validate a single enum value."""
+    v = (v or "").strip().upper()
+    return v
+
+
+def _parse_macro_response(raw: str) -> dict:
+    """
+    Extract and validate the strict JSON schema from LLM raw text.
+
+    Schema: {"macro_regime": "...", "btc_strength": "...", "volatility_warning": "..."}
+    """
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON object found in LLM response")
+
+    parsed = json.loads(match.group())
+
+    macro_regime   = _norm(parsed.get("macro_regime", ""))
+    btc_strength   = _norm(parsed.get("btc_strength", ""))
+    volatility     = _norm(parsed.get("volatility_warning", ""))
+
+    # Enforce enum validity — substitute invalid values with NEUTRAL
+    if macro_regime not in VALID_MACRO_REGIME:
+        macro_regime = "NEUTRAL"
+    if btc_strength not in VALID_BTC_STRENGTH:
+        btc_strength = "NEUTRAL"
+    if volatility not in VALID_VOLATILITY:
+        volatility = "LOW"
+
+    return {
+        "macro_regime":       macro_regime,
+        "btc_strength":       btc_strength,
+        "volatility_warning": volatility,
+        "_error":            None,
+        "_block_reason":     None,
+    }
+
+
+# ─── Plutus V2: Macro Risk Officer ──────────────────────────────────────────
+
+def get_llm_macro_context(
+    btc_analysis: dict,
+    target_symbol: str,
+    target_analysis: dict,
+    market_overview: dict,
+    provider: str = "minimax",
+) -> dict:
+    """
+    Plutus V2 — The LLM is promoted from Trade Signal Generator to
+    Macro Risk Officer. It returns ONLY macro context; trade decisions
+    are made by the mathematical rules in WorkflowStrategy.
+
+    Returns:
+        {{
+            "macro_regime":       "RISK_ON" | "RISK_OFF" | "NEUTRAL",
+            "btc_strength":       "STRONG"  | "WEAK"    | "NEUTRAL",
+            "volatility_warning": "HIGH"    | "LOW",
+            "_error":             str | None,   # network/parse error message
+            "_block_reason":      str | None,   # non-blocking advisory note
+        }}
+
+    Enforced JSON schema — no BUY/SELL/Stop-loss output permitted.
+    """
+    # Build BTC section
+    btc_trend   = btc_analysis.get("trend", "N/A") if btc_analysis else "N/A"
+    btc_rsi     = btc_analysis.get("rsi", 0)       if btc_analysis else 0
+    btc_price   = btc_analysis.get("current_price", 0) if btc_analysis else 0
+    btc_support = btc_analysis.get("support", 0)    if btc_analysis else 0
+    btc_resist  = btc_analysis.get("resistance", 0) if btc_analysis else 0
+
+    # Build target section
+    tgt_trend   = target_analysis.get("trend", "N/A")       if target_analysis else "N/A"
+    tgt_rsi     = target_analysis.get("rsi", 0)              if target_analysis else 0
+    tgt_price   = target_analysis.get("current_price", 0)    if target_analysis else 0
+
+    # Fear & Greed
+    fg_raw = market_overview.get("fear_greed_index", "NA") if market_overview else "NA"
+    fg_val: Optional[int] = None
+    if isinstance(fg_raw, int):
+        fg_val = fg_raw
+    elif isinstance(fg_raw, str):
+        try:
+            fg_val = int(fg_raw.strip())
+        except Exception:
+            fg_val = None
+
+    if isinstance(fg_val, int):
+        if fg_val <= 25:
+            fg_desc = f"Extreme Fear ({fg_val})"
+        elif fg_val >= 75:
+            fg_desc = f"Extreme Greed ({fg_val})"
+        else:
+            fg_desc = f"Neutral ({fg_val})"
+    else:
+        fg_desc = "NA"
+
+    # Market cap, dominance
+    total_cap  = market_overview.get("total_market_cap", 0) if market_overview else 0
+    btc_dom    = market_overview.get("btc_dominance", 0)    if market_overview else 0
+    volume_24h = market_overview.get("volume_24h", 0)       if market_overview else 0
+
+    prompt = f"""You are the Macro Risk Officer for a systematic crypto hedge fund.
+
+Your ONLY job is to assess the macro environment. Do NOT output trade signals (BUY/SELL/Stop-Loss/TP). Do NOT calculate position sizes. Your output is consumed by an automated Execution Gate — be precise and concise.
+
+You MUST respond with ONLY a single valid JSON object. No markdown, no explanation, no preamble. The JSON must match this exact schema:
+
+{{"macro_regime": "<RISK_ON|RISK_OFF|NEUTRAL>", "btc_strength": "<STRONG|WEAK|NEUTRAL>", "volatility_warning": "<HIGH|LOW>"}}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GUIDANCE FOR EACH FIELD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+macro_regime — overall market risk appetite:
+  RISK_ON   = Fear & Greed >= 55, risk assets outperforming, no major macro headwinds, crypto sentiment positive
+  RISK_OFF  = Fear & Greed <= 35, DXY strengthening, equity markets selling off, geopolitical tension, crypto sentiment negative
+  NEUTRAL   = Everything in between
+
+btc_strength — BTC's trend and relative dominance:
+  STRONG    = BTC in clear uptrend (EMA50 > EMA200), BTC dominance stable or rising, price above key EMAs
+  WEAK      = BTC in downtrend (EMA50 < EMA200), BTC dominance falling, price below key EMAs, liquidity grabs evident
+  NEUTRAL   = BTC ranging, mixed signals
+
+volatility_warning — current market volatility regime:
+  HIGH      = ATR elevated vs 20-bar average (>1.5x), Fear & Greed at extremes (<25 or >80), major news events (FOMC/CPI/war/regulation) within 24-48h, unusual volume spikes
+  LOW       = Normal volatility environment, no extreme Fear & Greed, no scheduled high-impact events
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MARKET DATA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+BTC Analysis:
+- Price:   ${btc_price:,.2f}
+- Trend:   {btc_trend}
+- RSI(14): {btc_rsi:.1f}
+- Support: ${btc_support:,.2f}
+- Resist:  ${btc_resist:,.2f}
+
+Target Symbol ({target_symbol}):
+- Price:   ${tgt_price:,.2f}
+- Trend:   {tgt_trend}
+- RSI(14): {tgt_rsi:.1f}
+
+Market Overview:
+- Fear & Greed: {fg_desc}
+- Total Market Cap: ${total_cap/1e12:.2f}T
+- BTC Dominance: {btc_dom:.1f}%
+- 24h Volume: ${volume_24h/1e9:.1f}B
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT RULE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Output ONLY the JSON object. Nothing else. Example valid output:
+{{"macro_regime": "RISK_ON", "btc_strength": "STRONG", "volatility_warning": "LOW"}}
+"""
+
+    messages = [{"role": "user", "content": prompt}]
+
+    try:
+        response = llm_client.chat(messages)
+        return _parse_macro_response(response)
+    except json.JSONDecodeError as e:
+        result = dict(FALLBACK_CONTEXT)
+        result["_error"] = f"JSON parse error: {e} | raw: {response[:200]}"
+        return result
+    except Exception as e:
+        result = dict(FALLBACK_CONTEXT)
+        result["_error"] = f"LLM call failed: {e}"
+        return result
+
+
+# ─── Legacy: Trade Signal Generator (kept for llm_strategy.py compat) ─────────
+
 def analyze_market(
     btc_data: dict,
     target_data: dict,
@@ -62,8 +255,12 @@ def analyze_market(
     volume_zone: str = "MID_RANGE",
 ) -> dict:
     """
-    Use LLM to analyze market and generate trading decision.
+    [LEGACY] Use LLM to analyze market and generate trading decision.
     Includes multi-timeframe analysis and volume profile.
+
+    NOTE: This function is DEPRECATED for Plutus V2. The LLM should
+    only output macro context via get_llm_macro_context().
+    Kept here for backward compatibility with llm_strategy.py.
     """
     # Build multi-timeframe section
     tf_section = ""
@@ -187,9 +384,6 @@ Respond in JSON format:
     try:
         response = llm_client.chat(messages)
         # Parse JSON from response
-        import json
-        import re
-
         # Find JSON in response
         match = re.search(r'\{.*\}', response, re.DOTALL)
         if match:

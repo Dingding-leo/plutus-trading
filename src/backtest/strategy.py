@@ -346,6 +346,8 @@ def run_backtest(
     initial_equity: float = 10000,
     config: StrategyConfig = None,
     market: str = "futures",
+    use_llm: bool = False,
+    llm_provider: str = "minimax",
 ) -> dict:
     """
     Run complete backtest.
@@ -380,7 +382,17 @@ def run_backtest(
         initial_equity=initial_equity,
     )
 
-    strategy = WorkflowStrategy(config or StrategyConfig())
+    # Plutus V2: Hybrid strategy when --use-llm, pure-rule otherwise
+    if use_llm:
+        from .hybrid_strategy import HybridWorkflowStrategy
+        strategy = HybridWorkflowStrategy(
+            config=config or StrategyConfig(),
+            use_llm=True,
+            llm_provider=llm_provider,
+            llm_cache_seconds=3600,
+        )
+    else:
+        strategy = WorkflowStrategy(config or StrategyConfig())
 
     # Create backtester with market preference
     backtester = MultiCoinBacktester(engine)
