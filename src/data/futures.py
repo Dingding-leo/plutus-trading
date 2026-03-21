@@ -1,0 +1,41 @@
+"""
+All USDT-M Futures pairs on Binance.
+All symbols use NO-HYPHEN format (e.g., BTCUSDT, not BTC-USDT).
+"""
+
+# List of USDT-M futures pairs (major + alts)
+USDT_FUTURES = [
+    # Major
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
+    # Top alts
+    "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
+    "DOTUSDT", "MATICUSDT", "LINKUSDT", "UNIUSDT",
+    "ATOMUSDT", "LTCUSDT", "ETCUSDT", "XLMUSDT",
+    "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
+    # More alts
+    "FILUSDT", "ICPUSDT", "HBARUSDT", "VETUSDT",
+    "ALGOUSDT", "FTMUSDT", "SANDUSDT", "MANAUSDT",
+    "AAVEUSDT", "AXSUSDT", "THETAUSDT", "EOSUSDT",
+    "XTZUSDT", "CAKEUSDT", "GRTUSDT", "NEOUSDT",
+    "KAVAUSDT", "ZECUSDT", "ENJUSDT", "BATUSDT",
+    "1INCHUSDT", "COMPUSDT", "SNXUSDT", "YFIUSDT",
+    "MKRUSDT", "SUSHIUSDT", "CRVUSDT", "RUNEUSDT",
+    # Recent movers
+    "PEPEUSDT", "WIFUSDT", "BONKUSDT", "SUIUSDT",
+    "SEIUSDT", "INJUSDT", "TIAUSDT", "BLURUSDT",
+    "IMXUSDT", "LDOUSDT", "QNTUSDT", "RNDRUSDT",
+    "STXUSDT", "KASUSDT", "CKBUSDT", "ORDIUSDT",
+]
+
+# Major coins only (safer for backtesting)
+MAJOR_COINS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
+    "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
+]
+
+# Mid-tier coins
+MID_COINS = [
+    "DOTUSDT", "MATICUSDT", "LINKUSDT", "UNIUSDT",
+    "ATOMUSDT", "LTCUSDT", "ETCUSDT", "XLMUSDT",
+    "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
+]

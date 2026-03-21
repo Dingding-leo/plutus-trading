@@ -1,0 +1,7 @@
+# Plutus Trading System - Dependencies
+
+# HTTP requests
+requests>=2.28.0
+
+# For CLI (if using argparse, stdlib is enough)
+# No additional CLI deps needed (using argparse from stdlib)
