@@ -17,6 +17,12 @@ from .trade_plan import (
     validate_trade_plan,
     format_trade_plan,
 )
+from .portfolio_matrix import (
+    CorrelationEngine,
+    RiskManager,
+    PairsTrader,
+    PortfolioMatrix,
+)
 
 __all__ = [
     # position sizer
@@ -34,4 +40,9 @@ __all__ = [
     "create_trade_plan",
     "validate_trade_plan",
     "format_trade_plan",
+    # portfolio matrix
+    "CorrelationEngine",
+    "RiskManager",
+    "PairsTrader",
+    "PortfolioMatrix",
 ]

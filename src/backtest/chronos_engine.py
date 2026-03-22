@@ -56,6 +56,7 @@ from ..data.personas import (
     SMC_ICT_Persona, OrderFlowPersona, MacroOnChainPersona,
     create_persona,
 )
+from ..models.meta_learning import MoEWeighter, update_weights
 from ..backtest.portfolio_manager import DynamicAllocator
 from ..data.memory import MemoryBank
 
@@ -187,7 +188,7 @@ class ChronosBacktester:
         self,
         mode: BacktestMode = BacktestMode.DRY_RUN,
         initial_equity: float = 10_000.0,
-        min_confidence: int = 40,
+        min_confidence: int = 60,
         lookback: int = 30,
         temperature: float = 1.0,
         penalty_factor: float = 0.1,
@@ -204,6 +205,16 @@ class ChronosBacktester:
         self.log_file = log_file
 
         self._scanner = VanguardScanner()
+
+        # OPERATION DARWIN: MoEWeighter tracks Sortino-weighted persona allocation.
+        # Initialised with same lookback/temperature as the allocator;
+        # weights are updated after every trade outcome and used for the blended vote.
+        self._weighter = MoEWeighter(
+            personas=[p.value for p in self.PERSONAS],
+            lookback=lookback,
+            temperature=temperature,
+        )
+
         self._allocator = DynamicAllocator(
             personas=self.PERSONAS,
             lookback=lookback,
@@ -348,7 +359,15 @@ class ChronosBacktester:
                 signal = self._call_llm_persona(persona_type, data, past_lessons)
 
             # Force strict direction alignment: cannot counter-trade the mathematical trigger
-            if trigger_direction != "NEUTRAL" and signal.direction.value != "NEUTRAL" and signal.direction.value != trigger_direction:
+            # trigger uses BULLISH/BEARISH, signal uses LONG/SHORT — normalize for comparison
+            TRIGGER_TO_SIGNAL = {"BULLISH": "LONG", "BEARISH": "SHORT"}
+            aligned_trigger = TRIGGER_TO_SIGNAL.get(trigger_direction, trigger_direction)
+            is_conflict = (
+                trigger_direction != "NEUTRAL"
+                and signal.direction.value != "NEUTRAL"
+                and signal.direction.value != aligned_trigger
+            )
+            if is_conflict:
                 print(f"  ⚠ Overriding {persona_type.value} vote: {signal.direction.value} conflicts with trigger direction {trigger_direction}. Setting to NEUTRAL.")
                 signal.direction = Direction.NEUTRAL
                 signal.confidence = 0
@@ -362,12 +381,16 @@ class ChronosBacktester:
             print(f"  {persona_type.value:15s}: {signal.direction.value:7s} "
                   f"conf={signal.confidence:3d} lev={signal.leverage}x | {signal.thesis[:50]}...")
 
-        # ── Step c & d: Allocator allocate (using history up to now) ───────
+        # ── Step c & d: Weight allocation (using history up to now) ────
+        # OPERATION DARWIN: blended vote uses Sortino-softmax weights from MoEWeighter
+        # (replaces static 0.33 allocation — weights shift dynamically as trades are won/lost)
+        weights = self._weighter.get_weights()
+
+        # Allocator fitness is still tracked for GA selection / turnover penalty
         weights_snapshot = self._allocator.allocate()
-        weights = {p.value: float(w) for p, w in zip(self.PERSONAS, weights_snapshot.weights)}
         fitnesses = {p.value: float(f) for p, f in zip(self.PERSONAS, weights_snapshot.fitnesses)}
 
-        print(f"  Weights: {weights}")
+        print(f"  Weights (Darwin MoE): {weights}")
         print(f"  Fitness: {fitnesses}")
 
         # ── Step e: Blended vote + execution decision ────────────────────────
@@ -386,6 +409,9 @@ class ChronosBacktester:
             # Even if skipped, update allocator with 0 returns for this epoch
             returns_dict = {p: 0.0 for p in self.PERSONAS}
             positions_dict = {p: self._equity for p in self.PERSONAS}
+            # OPERATION DARWIN: feed 0 returns to the weighter so it learns "no trade"
+            for p in self.PERSONAS:
+                self._weighter.update(p.value, 0.0)
             self._allocator.update_all(signals, returns_dict, positions_dict)
             return
 
@@ -426,6 +452,13 @@ class ChronosBacktester:
                 # Position value for turnover penalty
                 pos_mult = sig.confidence / 100.0
                 positions_dict[p] = working_equity * pos_mult * sig.leverage
+
+        # OPERATION DARWIN: feed realised returns to the Sortino-based weighter
+        for p in self.PERSONAS:
+            sig = signals.get(p)
+            if sig and sig.direction.value != "NEUTRAL":
+                ret = returns_dict.get(p, 0.0)
+                self._weighter.update(p.value, ret)
 
         self._allocator.update_all(signals, returns_dict, positions_dict)
 
@@ -729,6 +762,16 @@ class ChronosBacktester:
         
         # 4. Notional value of the position
         notional = size_coins * entry
+
+        # GHOST SNIPER: Enforce Binance min notional $5
+        if notional < 5.0:
+            notional = 5.0
+            size_coins = 5.0 / entry
+            # If bumping to $5 notional causes loss to exceed 2% of account, reject trade
+            loss_at_min = risk_pct * working_equity  # already bumped to 2%
+            if loss_at_min > working_equity * 0.02:
+                return {"result": "SKIPPED", "pnl": 0.0, "pnl_pct": 0.0,
+                        "reason": "SKIPPED: SL too wide for $50 account"}
         
         # 5. Cap leverage (e.g. max 10x account equity)
         max_notional = working_equity * 10
@@ -740,7 +783,8 @@ class ChronosBacktester:
         trade.position_value = notional  # Update trade object with actual size
         
         # 6. Friction / Fees
-        fee_rate = 0.0006  # 0.06% per side (taker)
+        maker_fee_pct: float = 0.0002  # Binance maker fee = 0.02%
+        fee_rate = maker_fee_pct
         entry_fee = notional * fee_rate
 
         look_ahead = 48  # candles to scan for outcome
@@ -872,6 +916,26 @@ class ChronosBacktester:
             self._reflexions_run += 1
             print(f"  💾 Saved to MemoryBank (total reflexions: {self._reflexions_run})")
 
+        # OPERATION DARWIN: after every LOSS, recalibrate scanner thresholds to current volatility.
+        # Uses GeneticOptimizer.recalibrate_scanner() which adapts:
+        #   High vol  → wider sweep threshold, stricter z-score, higher min_confidence
+        #   Low vol   → tighter sweep threshold, looser z-score, lower min_confidence
+        if outcome.get("result") == "LOSS" and outcome.get("pnl_pct", 0) < -1.0:
+            from ..models.meta_learning import GeneticOptimizer, ScannerConfig
+            if not hasattr(self, "_ga_optimizer") or self._ga_optimizer is None:
+                # Initialise with default ScannerConfig (no SCANNER_CONFIG in sys_config yet)
+                self._ga_optimizer = GeneticOptimizer()
+            # Derive current volatility from the ATR embedded in context data
+            atr = ctx.get("atr_14", 0.0)
+            current_price = ctx.get("current_price", ctx.get("candle_close", 100_000.0))
+            vol_now = abs(atr / current_price) if current_price > 0 else 0.02
+            new_cfg = self._ga_optimizer.recalibrate_scanner(current_volatility=vol_now)
+            # NOTE: scanner.update_config() must be implemented in scanner.py to accept new thresholds
+            if hasattr(self._scanner, "update_config"):
+                self._scanner.update_config(new_cfg)
+            print(f"  🧬 GA recalibrated scanner → sweep={new_cfg.sweep_threshold:.4f} "
+                  f"z={new_cfg.deviation_z_score:.2f} conf={new_cfg.min_confidence_threshold}")
+
     # ── PnL tracking ──────────────────────────────────────────────────────
 
     def _build_equity_curve(self) -> List[Dict]:
@@ -997,7 +1061,7 @@ def run_chronos_backtest(
     df: pd.DataFrame,
     mode: BacktestMode = BacktestMode.DRY_RUN,
     initial_equity: float = 10_000.0,
-    min_confidence: int = 40,
+    min_confidence: int = 60,
     **kwargs,
 ) -> Dict[str, Any]:
     """One-liner for CLI wiring."""

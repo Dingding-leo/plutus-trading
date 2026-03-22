@@ -1,0 +1,223 @@
+# ==============================================================================
+# Plutus V4 — Risk Limits Configuration
+# ==============================================================================
+# Designed for a $10,000 starting account.
+# Mode is injected at runtime; scalar anchors provide DRY_RUN vs LIVE defaults.
+# Rationale is stored here for audit and review — not parsed by the engine.
+#
+# Quick reference ($10k starting account):
+#   Notional per trade  : $5,000 (LIVE) / $10,000 (DRY_RUN)
+#   Max correlated beta : 50% equity LIVE / unlimited DRY_RUN
+#   Max leverage        : 5x–15x LIVE / 8x–20x DRY_RUN (by risk env)
+#   Session loss hard   : -5% LIVE / -10% DRY_RUN
+#   Daily drawdown kill : -5%
+#   Absolute equity min : $1,000
+#   Cooldown after kill : 30 minutes
+# ==============================================================================
+
+# ─── Scalar Anchors ───────────────────────────────────────────────────────────
+# YAML anchors can only reference scalar values (not entire dicts).
+# Define scalar values here and reference them inside section dry_run/live dicts.
+# Anchors are placed under _anchors: so the loader can strip them from the config dict.
+
+_anchors:
+
+  # DRY_RUN scalars
+  DRY_NOTIONAL: &DRY_NOTIONAL 10000
+  DRY_SESSION_HARD: &DRY_SESSION_HARD -0.10
+  DRY_SESSION_WARN: &DRY_SESSION_WARN -0.07
+  DRY_LEVERAGE_MAX: &DRY_LEVERAGE_MAX 20
+
+  # LIVE scalars
+  LIVE_NOTIONAL: &LIVE_NOTIONAL 5000
+  LIVE_SESSION_HARD: &LIVE_SESSION_HARD -0.05
+  LIVE_SESSION_WARN: &LIVE_SESSION_WARN -0.03
+  LIVE_LEVERAGE_LOW: &LIVE_LEVERAGE_LOW 15
+  LIVE_LEVERAGE_MOD: &LIVE_LEVERAGE_MOD 10
+  LIVE_LEVERAGE_HIGH: &LIVE_LEVERAGE_HIGH 5
+
+# ==============================================================================
+# GLOBAL SETTINGS
+# ==============================================================================
+
+mode: live              # Override with 'dry_run' or 'live'; consumed by RiskGuard
+initial_capital: 10000.0   # $10,000 — used for % calculations
+
+# Session definition
+session_duration_minutes: 480   # 8 hours = one trading session
+
+# ==============================================================================
+# SECTION 1: GLOBAL DRAWDOWN LIMITS
+# Halts ALL trading if equity drops X% within a rolling N-hour window.
+# Prevents compounding losses during sustained drawdown / black swan events.
+# ==============================================================================
+
+global_drawdown:
+  enabled: true
+  rolling_window_hours: 24
+  halt_threshold_pct: -0.08
+  rationale: |
+    Sustained 8%+ drawdown in 24h is almost always a black swan (regulation
+    shock, macro event, exchange outage). Halting prevents compounding losses
+    while the system reassesses. -8% gives room for normal high-vol days in
+    crypto without triggering false positives.
+
+# ==============================================================================
+# SECTION 2: FAT-FINGER PROTECTION
+# Max notional exposure per individual trade.
+# Rationale: A misplaced decimal or wrong asset at high leverage blows the account.
+# ==============================================================================
+
+fat_finger_protection:
+  # max_notional is the per-trade cap; total_notional_pct is the aggregate cap
+  dry_run:
+    max_notional: *DRY_NOTIONAL
+    max_total_notional_pct_of_equity_training: 5.0
+    max_total_notional_pct_of_equity_advanced: 10.0
+    rationale: |
+      Paper trade limit — allows full strategy stress-test.
+      Aggregate cap of 5× equity in training mode prevents runaway concentration.
+  live:
+    max_notional: *LIVE_NOTIONAL
+    max_total_notional_pct_of_equity_training: 3.0
+    max_total_notional_pct_of_equity_advanced: 5.0
+    rationale: |
+      FAT-FINGER PROTECTION: prevents a misplaced decimal from blowing account.
+      At $10k equity, $5k notional = 50% capital with 10x leverage.
+      Aggregate cap of 3× equity prevents accumulating 10+ concurrent positions
+      each near max notional (effectively 50×+ account exposure).
+
+# ==============================================================================
+# SECTION 3: CORRELATED EXPOSURE LIMITS
+# Max % of account exposed to correlated crypto beta (BTC, ETH, SOL, BNB, XRP)
+# and alt beta (everything else).
+# ==============================================================================
+
+correlated_exposure:
+  dry_run:
+    crypto_beta_pct: null     # null = no limit in dry run
+    alt_beta_pct: null
+    rationale: "No correlated exposure cap in dry run — paper portfolio can concentrate."
+  live:
+    crypto_beta_pct: 0.50    # max 50% of equity in correlated crypto beta
+    alt_beta_pct: 0.30      # max 30% in alt beta
+    rationale: |
+      If BTC dumps 10%, you don't want 90% of your account correlated to BTC.
+      Splitting crypto beta vs alt beta ensures diversification even within crypto.
+      Crypto beta = BTC, ETH, SOL, BNB, XRP (high pairwise correlation).
+      Alt beta = everything else (MKR, AAVE, etc.)
+  crypto_beta_symbols: [BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT]
+  alt_beta_symbols: []      # Everything not in crypto_beta_symbols
+
+# ==============================================================================
+# SECTION 4: LEVERAGE CIRCUIT BREAKERS
+# Maximum allowed leverage by risk environment.
+# ==============================================================================
+
+leverage_circuit_breakers:
+  dry_run:
+    max_leverage_low_risk: *DRY_LEVERAGE_MAX
+    max_leverage_moderate_risk: *DRY_LEVERAGE_MAX
+    max_leverage_high_risk: *DRY_LEVERAGE_MAX
+    rationale: "Up to 20x in dry run regardless of risk environment."
+  live:
+    max_leverage_low_risk: *LIVE_LEVERAGE_LOW
+    max_leverage_moderate_risk: *LIVE_LEVERAGE_MOD
+    max_leverage_high_risk: *LIVE_LEVERAGE_HIGH
+    rationale: |
+      HIGH risk triggers (any ONE triggers HIGH):
+        1. CPI/FOMC/NFP/war/regulation event
+        2. ATR(15) >= 1.5x 30-bar ATR average
+        3. 30m structure just broken / key levels repeatedly false-breaking
+      In HIGH risk, max leverage drops to 5x. The stop distance is wider, so
+      the position is smaller even at lower leverage. Survive first, profit second.
+
+# ==============================================================================
+# SECTION 5: SINGLE-SESSION LOSS LIMITS
+# Max losses allowed per defined trading session (480 min / 8 hours).
+# ==============================================================================
+
+session_loss_limits:
+  dry_run:
+    hard_stop_pct: *DRY_SESSION_HARD
+    warning_pct: *DRY_SESSION_WARN
+    rationale: "Dry run is more lenient — backtester can generate eccentric PnL."
+  live:
+    hard_stop_pct: *LIVE_SESSION_HARD
+    warning_pct: *LIVE_SESSION_WARN
+    rationale: |
+      -5% in one session is catastrophic for a $10k account ($500 loss).
+      Trading while emotionally compromised after a big loss leads to revenge trading.
+      The warning at -3% gives a heads-up before the hard stop.
+
+# ==============================================================================
+# SECTION 6: MARGIN CALL BUFFERS
+# Minimum distance from estimated liquidation to allow new positions.
+# ==============================================================================
+
+margin_call_buffers:
+  enabled: true
+  major_coin_min_distance_pct: 0.015    # 1.5% above estimated liquidation
+  small_coin_min_distance_pct: 0.025   # 2.5% above estimated liquidation
+  rationale: |
+    Major coins (BTC, ETH): 1.5% buffer = price can spike 1.5% against you
+    before approaching liquidation. At 10x leverage, 1.5% is one normal 15m candle —
+    enough buffer to avoid wick-triggered liquidation.
+    Small cap coins: 2.5% buffer = alts have thinner order books, wider spreads,
+    and faster moves. 2.5% prevents flush-outs from liquidity cascades.
+    Estimated liquidation = entry_price +/- (1 / leverage * entry_price)
+
+# ==============================================================================
+# SECTION 7: ABSOLUTE EQUITY FLOOR
+# Hard block: no new positions if equity drops below this absolute minimum.
+# ==============================================================================
+
+absolute_equity_floor:
+  enabled: true
+  minimum_equity: 1000            # $1,000 hard floor
+  rationale: |
+    10% survival floor on a $10,000 account. Below $1,000, even perfect trades
+    struggle to recover (fees become significant % of remaining capital).
+    No new positions allowed — trader must deposit or reassess strategy.
+    Warning threshold at $2,000 gives 48h notice before hitting the floor.
+
+# ==============================================================================
+# SECTION 8: V4 BLACK SWAN RULES
+# Emergency shutdown and recovery protocols for extreme events.
+# ==============================================================================
+
+black_swan:
+  daily_drawdown_auto_flatten_pct: -0.05   # -5% in a single day → flatten all
+  rationale_auto_flatten: |
+    -5% in one day in crypto is either a black swan (FTX collapse: -25% in 7 days)
+    or a massive liquidity event. Flattening all positions prevents the account
+    from being caught in a cascading liquidation chain. Cash is king during black swans.
+
+  consecutive_session_stops_kill: 2
+  rationale_kill_switch: |
+    Two consecutive -5% sessions = -10% in two days = statistically unlikely
+    in a functioning market. Either the strategy has broken or market conditions
+    have changed fundamentally. Kill switch forces full reassessment before resume.
+
+  cooldown_after_kill_switch_minutes: 30
+  rationale_cooldown: |
+    30 minutes = enough time for the trader to reassess, check news, and
+    prevent revenge trading. Not so long as to miss re-entry on a recovery.
+    In volatile markets, 30 minutes is enough for conditions to stabilize.
+
+# ==============================================================================
+# SECTION 9: ALERT THRESHOLDS
+# Warning and critical alert triggers for Telegram/email/webhook notifications.
+# These do NOT block trading — they notify the trader for awareness.
+# ==============================================================================
+
+alerts:
+  daily_drawdown_warning_pct: -0.03       # -3% daily → WARNING alert
+  daily_drawdown_critical_pct: -0.05      # -5% daily → CRITICAL alert
+  equity_warning: 2000                     # $2,000 → WARNING alert
+  equity_critical: 1500                   # $1,500 → CRITICAL alert
+  session_loss_warning_pct: -0.03         # -3% in session → WARNING
+  session_loss_critical_pct: -0.05        # -5% in session → CRITICAL
+  rationale: |
+    Alerts are WATCHDOGS, not guards. They notify but do not block.
+    The hard blocks (kill switch, equity floor) are in Sections 3–8 above.
