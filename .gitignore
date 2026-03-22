@@ -1,19 +1,57 @@
-.venv/
+# ─── Python ────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ─── IDE ─────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
 
-data_cache/
-logs/
-memory/
-backups/
+# ─── Secrets & Credentials ────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
 
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-htmlcov/
+# ─── Database ─────────────────────────────────────────────────────────────
+# SQLite memory bank (stores trading lessons)
+~/.plutus/memory.db
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ─── Data Files ────────────────────────────────────────────────────────────
+# Historical OHLCV data (large, regenerated) — anchored to repo root
+/data/
+*.csv
+*.parquet
+
+# ─── Logs ─────────────────────────────────────────────────────────────────
+/logs/
+*.log
+
+# ─── Test Coverage ────────────────────────────────────────────────────────
 .coverage
-coverage.xml
+/htmlcov/
+/.pytest_cache/
+
+# ─── Temporary Files ───────────────────────────────────────────────────────
+/tmp/
+/temp/
+*.tmp

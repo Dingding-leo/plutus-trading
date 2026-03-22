@@ -50,6 +50,7 @@ import numpy as np
 import pandas as pd
 
 from ..data.scanner import VanguardScanner, ScannerEvent, AnomalyType
+from .. import config as sys_config
 from ..data.personas import (
     PersonaSignal, PersonaType, Direction,
     SMC_ICT_Persona, OrderFlowPersona, MacroOnChainPersona,
@@ -81,9 +82,10 @@ class BlendedTrade:
     signals:           Dict[str, Dict]    # {persona: signal.to_dict()}
     position_value:    float
     leverage:         float
-    stop_loss:        float
-    take_profit:       float
-    rr_ratio:         float
+    entry_price:      float = 0.0
+    stop_loss:        float = 0.0
+    take_profit:       float = 0.0
+    rr_ratio:         float = 0.0
     trade_result:      Optional[str] = None   # "WIN" | "LOSS" | "OPEN"
     pnl:              Optional[float] = None
     notes:             List[str] = field(default_factory=list)
@@ -189,6 +191,7 @@ class ChronosBacktester:
         lookback: int = 30,
         temperature: float = 1.0,
         penalty_factor: float = 0.1,
+        compound: bool = True,
         log_file: str = "logs/chronos_trades.json",
     ):
         self.mode = mode
@@ -197,6 +200,7 @@ class ChronosBacktester:
         self.lookback = lookback
         self.temperature = temperature
         self.penalty_factor = penalty_factor
+        self.compound = compound
         self.log_file = log_file
 
         self._scanner = VanguardScanner()
@@ -215,6 +219,13 @@ class ChronosBacktester:
         self._max_drawdown = 0.0
         self._peak = initial_equity
         self._reflexions_run = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if hasattr(self._memory_bank, 'close'):
+            self._memory_bank.close()
 
     # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -260,8 +271,13 @@ class ChronosBacktester:
         print()
 
         # Step 3: Process each event
+        last_processed_idx = -1
         for i, event in enumerate(events):
+            if event.candle_idx == last_processed_idx:
+                print(f"[{i + 1}/{len(events)}] {event.timestamp} | {event.anomaly_type} | Skipping duplicate event at idx={event.candle_idx}")
+                continue
             self._process_event(event, df, event_log, i + 1, len(events))
+            last_processed_idx = event.candle_idx
 
         # Step 4: Compute metrics
         equity_curve = self._build_equity_curve()
@@ -308,14 +324,19 @@ class ChronosBacktester:
         # ── Step b: Build persona payloads ───────────────────────────────────
         signals: Dict[PersonaType, PersonaSignal] = {}
         signal_dicts: Dict[str, Dict] = {}
+        
+        trigger_direction = ctx.get("direction", "NEUTRAL")
+
+        # Batch RAG retrieval: fetch lessons for all personas in a single query
+        all_persona_values = [p.value for p in self.PERSONAS]
+        batch_lessons = self._memory_bank.retrieve_lessons_batch(
+            all_persona_values,
+            anomaly,
+            limit_per=3,
+        )
 
         for persona_type in self.PERSONAS:
-            # RAG retrieval: fetch past lessons for this persona + anomaly type
-            past_lessons = self._memory_bank.retrieve_lessons(
-                persona_type.value,
-                anomaly,
-                limit=3,
-            )
+            past_lessons = batch_lessons.get(persona_type.value, [])
 
             # Build persona-specific data dict from historical slice + event context
             data = self._build_persona_data(persona_type, hist_df, event)
@@ -326,6 +347,13 @@ class ChronosBacktester:
             else:
                 signal = self._call_llm_persona(persona_type, data, past_lessons)
 
+            # Force strict direction alignment: cannot counter-trade the mathematical trigger
+            if trigger_direction != "NEUTRAL" and signal.direction.value != "NEUTRAL" and signal.direction.value != trigger_direction:
+                print(f"  ⚠ Overriding {persona_type.value} vote: {signal.direction.value} conflicts with trigger direction {trigger_direction}. Setting to NEUTRAL.")
+                signal.direction = Direction.NEUTRAL
+                signal.confidence = 0
+                signal.warnings.append(f"Direction overridden to NEUTRAL due to conflict with {trigger_direction} trigger.")
+
             signals[persona_type] = signal
             signal_dicts[persona_type.value] = signal.to_dict()
 
@@ -334,11 +362,7 @@ class ChronosBacktester:
             print(f"  {persona_type.value:15s}: {signal.direction.value:7s} "
                   f"conf={signal.confidence:3d} lev={signal.leverage}x | {signal.thesis[:50]}...")
 
-        # ── Step c & d: Allocator update + allocate ──────────────────────
-        returns_dict = {p: 0.0 for p in self.PERSONAS}   # 0 for this epoch (live PnL tracked separately)
-        positions_dict = {p: self._equity for p in self.PERSONAS}
-
-        self._allocator.update_all(signals, returns_dict, positions_dict)
+        # ── Step c & d: Allocator allocate (using history up to now) ───────
         weights_snapshot = self._allocator.allocate()
         weights = {p.value: float(w) for p, w in zip(self.PERSONAS, weights_snapshot.weights)}
         fitnesses = {p.value: float(f) for p, f in zip(self.PERSONAS, weights_snapshot.fitnesses)}
@@ -359,12 +383,15 @@ class ChronosBacktester:
                 "executed": False,
                 "reason": f"confidence {blended['confidence']} < {self.min_confidence}",
             })
+            # Even if skipped, update allocator with 0 returns for this epoch
+            returns_dict = {p: 0.0 for p in self.PERSONAS}
+            positions_dict = {p: self._equity for p in self.PERSONAS}
+            self._allocator.update_all(signals, returns_dict, positions_dict)
             return
 
         # ── Step f: Simulate trade execution ──────────────────────────────
         trade = self._simulate_trade(event, blended, idx, ts, weights, fitnesses, signals)
         self._trades.append(trade)
-        self._track_pnl(trade)
 
         # ── Step g: Outcome simulation + Reflexion loop ──────────────────
         outcome = self._simulate_trade_outcome(df, idx, trade, blended)
@@ -376,6 +403,31 @@ class ChronosBacktester:
             self._wins += 1
         elif outcome["result"] == "LOSS":
             self._losses += 1
+            
+        # ── Step h: Update Allocator with actual returns ──────────────────
+        returns_dict = {}
+        positions_dict = {}
+        working_equity = self._equity if self.compound else self.initial_equity
+        for p in self.PERSONAS:
+            sig = signals.get(p)
+            if not sig or sig.direction.value == "NEUTRAL":
+                returns_dict[p] = 0.0
+                positions_dict[p] = 0.0
+            else:
+                # If persona agreed with trade direction, it gets the trade's PnL %
+                # If it disagreed, it gets the inverse (since its stop would have been hit, etc.)
+                if sig.direction.value == blended["direction"]:
+                    returns_dict[p] = outcome["pnl_pct"] / 100.0
+                elif sig.direction.value != "NEUTRAL":
+                    returns_dict[p] = -outcome["pnl_pct"] / 100.0
+                else:
+                    returns_dict[p] = 0.0
+                
+                # Position value for turnover penalty
+                pos_mult = sig.confidence / 100.0
+                positions_dict[p] = working_equity * pos_mult * sig.leverage
+
+        self._allocator.update_all(signals, returns_dict, positions_dict)
 
         # Reflexion loop: if loss > 1%, trigger psychologist for each voter
         if outcome["result"] == "LOSS" and outcome["pnl_pct"] < -1.0:
@@ -565,9 +617,9 @@ class ChronosBacktester:
                 short_score += w * c
 
         if long_score > short_score and long_score > 0:
-            return {"direction": "LONG",  "confidence": int(long_score)}
+            return {"direction": "LONG",  "confidence": int(max(0, min(100, long_score)))}
         elif short_score > long_score and short_score > 0:
-            return {"direction": "SHORT", "confidence": int(short_score)}
+            return {"direction": "SHORT", "confidence": int(max(0, min(100, short_score)))}
         else:
             return {"direction": "NEUTRAL", "confidence": 0}
 
@@ -605,12 +657,11 @@ class ChronosBacktester:
         rr = abs(tp - entry) / abs(entry - stop) if abs(entry - stop) > 0 else 0
         avg_weight = sum(weights.values()) / len(weights)
 
-        # Position size from blended confidence
-        pos_mult = confidence / 100.0
-        stop_dist = abs(entry - stop) / entry if entry > 0 else 0.01
-        effective_risk = self._equity * 0.01 * pos_mult
-        position_value = effective_risk / stop_dist if stop_dist > 0 else 0
+        # Base leverage from confidence
         leverage = 5 if confidence >= 70 else (4 if confidence >= 50 else 3)
+        
+        # We don't calculate position size here anymore, it's done dynamically in outcome
+        position_value = 0.0 
 
         return BlendedTrade(
             event_idx=idx,
@@ -623,6 +674,7 @@ class ChronosBacktester:
             signals={p.value: s.to_dict() for p, s in signals.items()},
             position_value=position_value,
             leverage=leverage,
+            entry_price=entry,
             stop_loss=stop,
             take_profit=tp,
             rr_ratio=rr,
@@ -650,66 +702,95 @@ class ChronosBacktester:
         WIN  = price hits TP before SL (for longs: close >= TP; for shorts: close <= TP)
         LOSS = price hits SL before TP (for longs: close <= SL; or lookahead exhausted)
         HOLD = price is between SL and TP when lookahead window expires
-
-        Args:
-            df:    Full DataFrame (needed to look ahead)
-            idx:   Entry candle index
-            trade: The BlendedTrade that was executed
-            blended: The blended vote dict
-
-        Returns:
-            Dict with keys: result ("WIN"|"LOSS"|"HOLD"), pnl (dollar), pnl_pct (%)
+        
+        Implements Fixed Fractional Risk math with 2% risk limit and fees.
         """
         direction = blended["direction"]
         if direction == "NEUTRAL":
             return {"result": "HOLD", "pnl": 0.0, "pnl_pct": 0.0}
 
-        entry     = trade.stop_loss  # approximate — SL is always opposite direction
-        if blended["direction"] == "LONG":
-            sl = trade.stop_loss
-            tp = trade.take_profit
-        else:
-            sl = trade.stop_loss
-            tp = trade.take_profit
+        entry = trade.entry_price
+        sl = trade.stop_loss
+        tp = trade.take_profit
+        
+        # --- Strict Risk & Position Sizing Math ---
+        # 1. Risk exactly DEFAULT_RISK_PCT of current equity
+        risk_pct = sys_config.DEFAULT_RISK_PCT
+        working_equity = self._equity if self.compound else self.initial_equity
+        risk_usd = working_equity * risk_pct
+        
+        # 2. Distance to stop loss
+        sl_dist = abs(entry - sl)
+        if sl_dist <= 0:
+            return {"result": "HOLD", "pnl": 0.0, "pnl_pct": 0.0}
+            
+        # 3. Size in coins needed to lose exactly risk_usd if SL is hit
+        size_coins = risk_usd / sl_dist
+        
+        # 4. Notional value of the position
+        notional = size_coins * entry
+        
+        # 5. Cap leverage (e.g. max 10x account equity)
+        max_notional = working_equity * 10
+        if notional > max_notional:
+            notional = max_notional
+            size_coins = notional / entry
+            # Risk is now less than 2% because we hit the leverage cap
+            
+        trade.position_value = notional  # Update trade object with actual size
+        
+        # 6. Friction / Fees
+        fee_rate = 0.0006  # 0.06% per side (taker)
+        entry_fee = notional * fee_rate
 
         look_ahead = 48  # candles to scan for outcome
         end_idx = min(idx + look_ahead + 1, len(df))
 
-        pnl = 0.0
         result = "HOLD"
+        exit_price = entry
 
         for j in range(idx + 1, end_idx):
             candle_low = float(df["low"].iloc[j])
             candle_high = float(df["high"].iloc[j])
             
             # Stop-loss hit first (pessimistic check: evaluate SL before TP for safety)
-            if blended["direction"] == "LONG" and candle_low <= sl:
-                pnl_pct = (sl - entry) / entry * 100 * trade.leverage
-                pnl = self._equity * (pnl_pct / 100)
+            if direction == "LONG" and candle_low <= sl:
                 result = "LOSS"
+                exit_price = sl
                 break
-            if blended["direction"] == "SHORT" and candle_high >= sl:
-                pnl_pct = (entry - sl) / entry * 100 * trade.leverage
-                pnl = self._equity * (pnl_pct / 100)
+            if direction == "SHORT" and candle_high >= sl:
                 result = "LOSS"
+                exit_price = sl
                 break
             # Take-profit hit
-            if blended["direction"] == "LONG" and candle_high >= tp:
-                pnl_pct = (tp - entry) / entry * 100 * trade.leverage
-                pnl = self._equity * (pnl_pct / 100)
+            if direction == "LONG" and candle_high >= tp:
                 result = "WIN"
+                exit_price = tp
                 break
-            if blended["direction"] == "SHORT" and candle_low <= tp:
-                pnl_pct = (entry - tp) / entry * 100 * trade.leverage
-                pnl = self._equity * (pnl_pct / 100)
+            if direction == "SHORT" and candle_low <= tp:
                 result = "WIN"
+                exit_price = tp
                 break
 
-        # Expiry without hitting SL or TP = HOLD (no PnL credited)
+        # Calculate final PnL if trade closed
         if result == "HOLD":
-            pnl_pct = 0.0
+            return {"result": "HOLD", "pnl": 0.0, "pnl_pct": 0.0}
+            
+        # Gross PnL
+        if direction == "LONG":
+            gross_pnl = (exit_price - entry) * size_coins
+        else:
+            gross_pnl = (entry - exit_price) * size_coins
+            
+        # Exit fee
+        exit_notional = size_coins * exit_price
+        exit_fee = exit_notional * fee_rate
+        
+        # Net PnL
+        net_pnl = gross_pnl - entry_fee - exit_fee
+        pnl_pct = (net_pnl / working_equity) * 100
 
-        return {"result": result, "pnl": round(pnl, 2), "pnl_pct": round(pnl_pct, 3)}
+        return {"result": result, "pnl": round(net_pnl, 2), "pnl_pct": round(pnl_pct, 3)}
 
     # ── Reflexion loop ──────────────────────────────────────────────────────────
 
@@ -762,11 +843,20 @@ class ChronosBacktester:
                 persona_type,
                 dry_run=(self.mode == BacktestMode.DRY_RUN),
             )
+            
+            # Fetch past lessons to inject into the psychologist's prompt
+            past_lessons = self._memory_bank.retrieve_lessons(
+                persona_type.value,
+                event.anomaly_type,
+                limit=3,
+            )
+
             rule = persona.reflect_on_loss(
                 anomaly_type=event.anomaly_type,
                 thesis=thesis,
                 pnl=pnl_val,
                 market_context=market_context,
+                past_lessons=past_lessons,
             )
 
             print(f"  📖 Lesson learned: \"{rule}\"")
@@ -783,10 +873,6 @@ class ChronosBacktester:
             print(f"  💾 Saved to MemoryBank (total reflexions: {self._reflexions_run})")
 
     # ── PnL tracking ──────────────────────────────────────────────────────
-
-    def _track_pnl(self, trade: BlendedTrade):
-        """Track equity curve and drawdown (called after trade execution, outcome applied via _simulate_trade_outcome)."""
-        pass
 
     def _build_equity_curve(self) -> List[Dict]:
         """Build equity curve from trades."""
@@ -843,7 +929,7 @@ class ChronosBacktester:
             "max_drawdown_pct": max_dd,
             "sharpe_approx": float(sharpe),
             "events_triggered": len(events),
-            "llm_calls_saved": len(events) == 0,  # True if no events
+            "llm_calls_skipped": len(events) == 0,  # True if no events
             "reflexions_run": self._reflexions_run,
             "lessons_in_bank": self._memory_bank.lesson_count(),
             "allocator_summary": self._allocator.summary(),
@@ -859,7 +945,6 @@ class ChronosBacktester:
             "trades_executed": 0,
             "trades": [],
             "equity_curve": [{"equity": self.initial_equity, "trade_num": 0}],
-            "trades": 0,
             "wins": 0,
             "losses": 0,
             "win_rate": 0.0,
@@ -869,7 +954,7 @@ class ChronosBacktester:
             "max_drawdown_pct": 0.0,
             "sharpe_approx": 0.0,
             "events_triggered": 0,
-            "llm_calls_saved": True,
+            "llm_calls_skipped": True,
             "reflexions_run": 0,
             "lessons_in_bank": self._memory_bank.lesson_count(),
             "note": note,
@@ -1006,8 +1091,8 @@ if __name__ == "__main__":
     clean_events = scanner2.scan(clean_df)
     if len(clean_events) == 0:
         result2 = engine.run_backtest(clean_df)
-        assert result2["llm_calls_saved"] is True
-        print(f"  ✓ Empty events → llm_calls_saved={result2['llm_calls_saved']}")
+        assert result2["llm_calls_skipped"] is True
+        print(f"  ✓ Empty events → llm_calls_skipped={result2['llm_calls_skipped']}")
 
     # ── Test 4: Blended vote calculation ──────────────────────────────────────
     print("\n[Test 4] Blended vote edge cases:")

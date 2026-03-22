@@ -2,6 +2,7 @@
 OKX API client for fetching historical OHLCV data.
 """
 
+import random
 import requests
 import time
 from typing import Optional, List
@@ -64,10 +65,16 @@ class OKXClient:
             params["before"] = before
 
         response = self.session.get(url, params=params, timeout=30)
+
+        if response.status_code == 429:
+            raise requests.exceptions.HTTPError("OKX rate limited")
+        if response.status_code >= 500:
+            raise requests.exceptions.HTTPError(f"OKX server error: {response.status_code}")
+
         data = response.json()
 
         if data.get("code") != "0":
-            raise Exception(f"OKX API Error: {data.get('msg', 'Unknown error')}")
+            raise requests.exceptions.HTTPError(f"OKX API Error: {data.get('msg', 'Unknown error')}")
 
         return data.get("data", [])
 
@@ -111,10 +118,14 @@ class OKXClient:
                 break
 
             # Fetch candles
-            if end_time:
-                candles = self.get_candles(instId, bar, 100, before=end_time)
-            else:
-                candles = self.get_candles(instId, bar, 100, after=current_after)
+            try:
+                if end_time:
+                    candles = self.get_candles(instId, bar, 100, before=end_time)
+                else:
+                    candles = self.get_candles(instId, bar, 100, after=current_after)
+            except requests.exceptions.HTTPError as e:
+                print(f"OKX API error: {e}. Stopping fetch.")
+                break
 
             if not candles:
                 break
@@ -152,8 +163,8 @@ class OKXClient:
             if start_time and int(candles[-1][0]) < start_time:
                 break
 
-            # Small delay to avoid rate limits
-            time.sleep(0.2)
+            # Small delay to avoid rate limits (jitter-based backoff)
+            time.sleep(0.2 * (0.5 + random.random()))
 
         # Sort by timestamp
         all_candles.sort(key=lambda x: x["timestamp"])

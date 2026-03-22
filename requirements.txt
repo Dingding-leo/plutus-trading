@@ -1,7 +1,16 @@
 # Plutus Trading System - Dependencies
 
 # HTTP requests
-requests>=2.28.0
+requests>=2.31.0,<2.33.0
 
-# For CLI (if using argparse, stdlib is enough)
-# No additional CLI deps needed (using argparse from stdlib)
+# Numerical computing
+numpy>=1.26.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+
+# Async HTTP (LLM client support)
+aiohttp>=3.9.0
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+requests-mock>=1.11.0

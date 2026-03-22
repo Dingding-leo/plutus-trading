@@ -14,7 +14,7 @@ Or use the CLI directly:
     python -m src.cli backtest --start 2025-01-01 --end 2026-01-01
 """
 
-__version__ = "1.0.0"
+__version__ = "3.1.0"
 
 # Core modules available at package level
 from . import config

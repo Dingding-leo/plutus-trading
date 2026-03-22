@@ -38,7 +38,7 @@ import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 
 # ─── Path helpers ──────────────────────────────────────────────────────────────
@@ -142,6 +142,37 @@ class MemoryBank:
         )
         return [row[0] for row in cur.fetchall()]
 
+    def retrieve_lessons_batch(
+        self,
+        personas: List[str],
+        anomaly_type: str,
+        limit_per: int = 3,
+    ) -> Dict[str, List[str]]:
+        """
+        Fetch lessons for multiple personas in a single query.
+        Returns dict mapping persona -> list of lesson strings.
+        """
+        if not personas:
+            return {}
+        placeholders = ','.join('?' * len(personas))
+        cur = self._conn.cursor()
+        cur.execute(
+            f"""
+            SELECT persona, lesson
+              FROM lessons
+             WHERE persona IN ({placeholders})
+               AND anomaly_type = ?
+             ORDER BY id DESC
+            """,
+            (*[p.strip() for p in personas], anomaly_type.strip()),
+        )
+        results: Dict[str, List[str]] = {p: [] for p in personas}
+        for persona, lesson in cur.fetchall():
+            p = persona.strip()
+            if len(results[p]) < limit_per:
+                results[p].append(lesson)
+        return results
+
     def retrieve_all_lessons(
         self,
         persona: Optional[str] = None,
@@ -196,17 +227,17 @@ class MemoryBank:
 
     def _init_db(self) -> None:
         """Create the DB file and schema if they don't exist."""
-        # Ensure parent directory exists
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-            isolation_level=None,  # autocommit; we manage transactions explicitly
-            timeout=30.0,          # prevent "database is locked" during concurrent backtests
-        )
-
         with self._lock:
+            # Ensure parent directory exists
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+
+            self._conn = sqlite3.connect(
+                str(self._db_path),
+                check_same_thread=False,
+                isolation_level=None,  # autocommit; we manage transactions explicitly
+                timeout=30.0,          # prevent "database is locked" during concurrent backtests
+            )
+
             cur = self._conn.cursor()
             cur.execute("PRAGMA journal_mode = WAL")      # write-ahead log for concurrency
             cur.execute("PRAGMA foreign_keys = ON")
@@ -241,13 +272,15 @@ class MemoryBank:
 
     def close(self):
         """Safely close the SQLite database connection."""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        with self._lock:
+            if getattr(self, '_conn', None):
+                self._conn.close()
+                self._conn = None
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+        return False
 

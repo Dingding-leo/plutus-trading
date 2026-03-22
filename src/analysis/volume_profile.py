@@ -199,13 +199,8 @@ def get_key_levels(
     recent_lows = lows[-50:]
 
     # Volume profile (now using high-low range for proper distribution)
-    profile = calculate_volume_profile(
-        closes[-200:],
-        volumes[-200:],
-        highs[-200:],
-        lows[-200:],
-        bins
-    )
+    profile_data = closes[-200:], volumes[-200:], highs[-200:], lows[-200:]
+    profile = calculate_volume_profile(*profile_data, bins)
     lvns = find_lvn(profile)
     hvns = find_hvn(profile)
 
@@ -241,35 +236,37 @@ def check_multi_timeframe_resonance(
             lvl.append(levels["recent_high"])
         if "recent_low" in levels:
             lvl.append(levels["recent_low"])
-        for lvn in levels.get("lvn", []):
-            lvl.append(lvn["price"])
-        for hvn in levels.get("hvn", []):
-            lvl.append(hvn["price"])
+        lvl.extend(lvn["price"] for lvn in levels.get("lvn", []))
+        lvl.extend(hvn["price"] for hvn in levels.get("hvn", []))
         return lvl
 
     all_5m = get_all_levels(levels_5m)
     all_15m = get_all_levels(levels_15m)
     all_30m = get_all_levels(levels_30m)
 
-    # Find matching levels
-    matches = []
-    for p5 in all_5m:
-        for p15 in all_15m:
-            diff = abs(p5 - p15) / p5 * 100
-            if diff <= tolerance_pct:
-                for p30 in all_30m:
-                    diff2 = abs(p5 - p30) / p5 * 100
-                    if diff2 <= tolerance_pct:
-                        avg_price = (p5 + p15 + p30) / 3
-                        matches.append(avg_price)
+    # Bucket by price tolerance to find matches in O(n) instead of O(n³)
+    bucket_size = tolerance_pct / 100
 
-    # Determine resonance strength
-    if len(matches) >= 3:
-        strength = "STRONG"
-    elif len(matches) >= 1:
-        strength = "MEDIUM"
-    else:
-        strength = "NONE"
+    def bucket_prices(prices: list[float]) -> dict[int, list[float]]:
+        buckets = {}
+        for p in prices:
+            key = round(p / bucket_size)
+            if key not in buckets:
+                buckets[key] = []
+            buckets[key].append(p)
+        return buckets
+
+    b5 = bucket_prices(all_5m)
+    b15 = bucket_prices(all_15m)
+    b30 = bucket_prices(all_30m)
+
+    common_keys = set(b5) & set(b15) & set(b30)
+    matches = []
+    for key in common_keys:
+        prices = b5[key] + b15[key] + b30[key]
+        matches.append(sum(prices) / len(prices))
+
+    strength = "STRONG" if len(matches) >= 3 else ("MEDIUM" if len(matches) >= 1 else "NONE")
 
     return {
         "resonance_strength": strength,

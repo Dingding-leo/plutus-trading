@@ -2,6 +2,8 @@
 CoinGecko API client for fetching market metrics.
 """
 
+import random
+
 import requests
 import time
 from typing import Optional
@@ -20,6 +22,18 @@ def get_global_data() -> Optional[dict]:
     for attempt in range(3):
         try:
             response = requests.get(url, timeout=10)
+
+            if response.status_code == 429:
+                # Rate limited — back off with jitter
+                retry_after = int(response.headers.get("Retry-After", 60))
+                wait_time = retry_after * (0.5 + random.random())
+                if attempt < 2:
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"Rate limited by CoinGecko after 3 attempts")
+                    return None
+
             response.raise_for_status()
 
             data = response.json()["data"]
@@ -62,7 +76,7 @@ def get_fear_greed_index() -> Optional[dict]:
             "value": value,
             "classification": classification,
         }
-    except Exception as e:
+    except (requests.exceptions.RequestException, requests.exceptions.Timeout, OSError) as e:
         print(f"Failed to fetch Fear & Greed Index: {e}")
         return None
 

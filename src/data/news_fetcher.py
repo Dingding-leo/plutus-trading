@@ -79,7 +79,7 @@ class NewsService:
                 ))
             return items
 
-        except Exception as e:
+        except (requests.exceptions.RequestException, requests.exceptions.Timeout, OSError) as e:
             print(f"Error fetching Binance announcements: {e}")
             return []
 
@@ -125,7 +125,7 @@ class NewsService:
                 ))
             return items
 
-        except Exception as e:
+        except (requests.exceptions.RequestException, requests.exceptions.Timeout, OSError) as e:
             print(f"Error fetching CryptoPanic news: {e}")
             return []
 
@@ -346,7 +346,7 @@ class NewsChecker:
                 "note": None,
             }
 
-        except Exception as e:
+        except (OSError, ValueError, TypeError) as e:
             print(f"Error checking news: {e}")
             return {
                 "has_critical_news": False,

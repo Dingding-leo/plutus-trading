@@ -96,12 +96,14 @@ FALLBACK_SIGNAL = {
 
 def _parse_signal_response(raw: str, persona: PersonaType) -> Dict[str, Any]:
     """Parse and validate a persona's JSON response against the universal schema."""
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
+    start = raw.find('{')
+    end = raw.rfind('}')
+    
+    if start == -1 or end == -1 or end < start:
         return {**FALLBACK_SIGNAL, "persona": persona.value}
 
     try:
-        parsed = json.loads(match.group())
+        parsed = json.loads(raw[start:end+1])
     except json.JSONDecodeError:
         return {**FALLBACK_SIGNAL, "persona": persona.value}
 
@@ -131,7 +133,7 @@ def _parse_signal_response(raw: str, persona: PersonaType) -> Dict[str, Any]:
         warnings.append("High confidence but NEUTRAL — verify if persona sees risk in both directions.")
 
     return {
-        "thesis":            parsed.get("thesis", "No thesis provided.")[:300],
+        "thesis":            parsed.get("thesis", "No thesis provided.")[:600],  # P0-FIX: was [:300] — macro regime thesis requires >300 chars
         "direction":         raw_dir,
         "confidence_score":  confidence,
         "recommended_leverage": leverage,
@@ -195,7 +197,9 @@ You must respond with ONLY a single valid JSON object. No markdown, no explanati
  "confidence_score": 0-100 integer,
  "recommended_leverage": 1-10 integer}
 
-Example: {"thesis": "BTC swept buy-side liquidity at $97000, rejected at daily supply OB. Bullish MSS forming on 4H — entering long on retest of $96000 with 3:1 RR to $99000.", "direction": "LONG", "confidence_score": 78, "recommended_leverage": 5}"""
+Example: {"thesis": "BTC swept buy-side liquidity at $97000, rejected at daily supply OB. Bullish MSS forming on 4H — entering long on retest of $96000 with 3:1 RR to $99000.", "direction": "LONG", "confidence_score": 78, "recommended_leverage": 5}
+
+TIERED ASSET PRIORITY: BTC anchors the market. If BTC signals WEAK, override any altcoin LONG signals to NEUTRAL."""
 
 # ─── Persona 2: ORDER FLOW ────────────────────────────────────────────────────
 
@@ -266,7 +270,9 @@ You must respond with ONLY a single valid JSON object. No markdown, no explanati
  "confidence_score": 0-100 integer,
  "recommended_leverage": 1-10 integer}
 
-Example: {"thesis": "BTC funding deeply negative (-0.15%), OI rising on Binance while falling on Bybit. Liquidation cluster at $95000, 4H compression tight. Squeeze setup forming — short squeeze snap is imminent to upside.", "direction": "LONG", "confidence_score": 85, "recommended_leverage": 7}"""
+Example: {"thesis": "BTC funding deeply negative (-0.15%), OI rising on Binance while falling on Bybit. Liquidation cluster at $95000, 4H compression tight. Squeeze setup forming — short squeeze snap is imminent to upside.", "direction": "LONG", "confidence_score": 85, "recommended_leverage": 7}
+
+TIERED ASSET PRIORITY: BTC anchors the market. If BTC signals WEAK, override any altcoin LONG signals to NEUTRAL."""
 
 # ─── Persona 3: MACRO ONCHAIN ─────────────────────────────────────────────────
 
@@ -340,7 +346,9 @@ You must respond with ONLY a single valid JSON object. No markdown, no explanati
  "confidence_score": 0-100 integer,
  "recommended_leverage": 1-10 integer}
 
-Example: {"thesis": "Fed balance sheet expanded $120B in the past 4 weeks (liquidity expanding). IBIT saw $850M net inflows yesterday. MVRV at 2.8 (early-cycle accumulation). Exchange reserves at 18-month lows. Regime A confirmed — deploying maximum size.", "direction": "LONG", "confidence_score": 91, "recommended_leverage": 8}"""
+Example: {"thesis": "Fed balance sheet expanded $120B in the past 4 weeks (liquidity expanding). IBIT saw $850M net inflows yesterday. MVRV at 2.8 (early-cycle accumulation). Exchange reserves at 18-month lows. Regime A confirmed — deploying maximum size.", "direction": "LONG", "confidence_score": 91, "recommended_leverage": 8}
+
+TIERED ASSET PRIORITY: BTC anchors the market. If BTC signals WEAK, override any altcoin LONG signals to NEUTRAL."""
 
 
 # ─── Persona Classes ────────────────────────────────────────────────────────────
@@ -355,7 +363,7 @@ class BasePersona:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
-        temperature: float = 0.6,
+        temperature: float = 0.3,
         dry_run: bool = False,
     ):
         self._client = LLMClient(
@@ -399,9 +407,15 @@ class BasePersona:
         try:
             raw = self._client.chat(messages, temperature=self._temperature)
             parsed = _parse_signal_response(raw, self.persona_type)
+            
+            try:
+                direction_enum = Direction(parsed["direction"])
+            except ValueError:
+                direction_enum = Direction.NEUTRAL
+
             return PersonaSignal(
                 thesis=parsed["thesis"],
-                direction=Direction(parsed["direction"]),
+                direction=direction_enum,
                 confidence=parsed["confidence_score"],
                 leverage=parsed["recommended_leverage"],
                 persona=self.persona_type,
@@ -449,6 +463,7 @@ class BasePersona:
         thesis: str,
         pnl: float,
         market_context: str = "",
+        past_lessons: Optional[List[str]] = None,
     ) -> str:
         """
         The Psychologist: After a losing trade, force the LLM to write a
@@ -462,6 +477,7 @@ class BasePersona:
             thesis:        The persona's stated thesis when entering the trade
             pnl:           Signed % loss (negative value, e.g. -2.3)
             market_context: Optional human-readable market data snapshot
+            past_lessons: Optional list of past lessons to inject
 
         Returns:
             A 1-sentence strict rule string (or fallback in dry_run).
@@ -487,8 +503,10 @@ class BasePersona:
             f"20-bar rolling low within 3 candles of a major resistance zone.\"\n"
         )
 
+        system_prompt = self._inject_lessons_into_system(self.SYSTEM_PROMPT, past_lessons)
+
         messages = [
-            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user",   "content": reflexion_prompt},
         ]
 

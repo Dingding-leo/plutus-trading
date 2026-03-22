@@ -2,32 +2,55 @@
 LLM Client for market analysis.
 """
 
+import hashlib
 import json
 import os
+import random
 import re
 import requests
+import time
+import warnings
 from typing import Optional, List, Dict
 
 
 # Default settings - can be overridden via environment variables
 DEFAULT_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.minimaxi.com/v1")
-DEFAULT_MODEL = os.environ.get("LLM_MODEL", "MiniMax-M2.5")
+DEFAULT_MODEL = os.environ.get("LLM_MODEL", "MiniMax-M2.7")
 
 
 class LLMClient:
     """Client for LLM API (MiniMax)."""
 
-    def __init__(self, api_key: str = None, base_url: str = None, model: str = None):
+    def __init__(self, api_key: str = None, base_url: str = None, model: str = None, cache_ttl: int = 300):
         self.api_key = api_key or os.environ.get("LLM_API_KEY", "")
+        if not self.api_key:
+            raise ValueError(
+                "LLM_API_KEY environment variable is not set. "
+                "Please set it before using the LLM client."
+            )
         self.base_url = base_url or DEFAULT_BASE_URL
         self.model = model or DEFAULT_MODEL
+        self._response_cache: dict = {}
+        self._cache_ttl = cache_ttl
+
+    def _compute_cache_key(self, messages: List[Dict], temperature: float) -> str:
+        content = "".join(m.get("content", "") for m in messages)
+        return hashlib.md5(f"{content}:{temperature}".encode()).hexdigest()
 
     def chat(
         self,
         messages: List[Dict[str, str]],
-        temperature: float = 0.7,
+        temperature: float = 0.3,
+        max_retries: int = 3,
     ) -> str:
-        """Send chat request."""
+        """Send chat request with exponential backoff for rate limits/errors."""
+        # Check cache first
+        cache_key = self._compute_cache_key(messages, temperature)
+        if cache_key in self._response_cache:
+            cached = self._response_cache[cache_key]
+            if time.time() - cached['timestamp'] < self._cache_ttl:
+                return cached['response']
+
         url = f"{self.base_url}/text/chatcompletion_v2"
 
         headers = {
@@ -41,15 +64,90 @@ class LLMClient:
             "temperature": temperature,
         }
 
-        response = requests.post(url, json=payload, headers=headers, timeout=60)
-        data = response.json()
+        for attempt in range(max_retries):
+            try:
+                # SSL is verified by default (verify=True). Add verify="/path/to/cert.pem"
+                # for self-signed certs if needed.
+                response = requests.post(url, json=payload, headers=headers, timeout=60)
 
-        if "choices" in data and len(data["choices"]) > 0:
-            return data["choices"][0]["message"]["content"]
-        elif "base_resp" in data:
-            raise Exception(f"API Error: {data['base_resp']['status_msg']}")
-        else:
-            raise Exception(f"Unexpected response: {data}")
+                # P0-FIX: handle HTTP errors with appropriate backoff
+                if response.status_code == 429:
+                    # Honour Retry-After header; minimum 60s for LLM providers
+                    retry_after = int(response.headers.get("Retry-After", 60))
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_after * (0.5 + random.random()))
+                        continue
+                elif response.status_code >= 500:
+                    # Server errors: scaled exponential backoff
+                    if attempt < max_retries - 1:
+                        time.sleep((2 ** attempt) * 5 * (0.5 + random.random()))
+                        continue
+
+                response.raise_for_status()  # unified: any non-200 raises
+                data = response.json()
+
+                if "choices" in data and len(data["choices"]) > 0:
+                    result = data["choices"][0]["message"]["content"]
+                    # Cache the result
+                    self._response_cache[cache_key] = {'response': result, 'timestamp': time.time()}
+                    return result
+                elif "base_resp" in data:
+                    raise Exception(f"API Error: {data['base_resp']['status_msg']}")
+                else:
+                    raise Exception(f"Unexpected response: {data}")
+
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    time.sleep((2 ** attempt) * 5)  # scale up for network errors too
+                    continue
+                raise Exception(f"Network error after {max_retries} attempts: {e}")
+
+        raise Exception("Max retries exceeded")
+
+    async def async_chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.3,
+        max_retries: int = 3,
+    ) -> str:
+        """Async version of chat using aiohttp."""
+        import aiohttp
+        import asyncio
+
+        url = f"{self.base_url}/text/chatcompletion_v2"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {"model": self.model, "messages": messages, "temperature": temperature}
+
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, headers=headers, timeout=60) as response:
+                        if response.status == 429:
+                            retry_after = int(response.headers.get("Retry-After", 60))
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(retry_after * (0.5 + random.random()))
+                                continue
+                        elif response.status >= 500:
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep((2 ** attempt) * 5 * (0.5 + random.random()))
+                                continue
+                        response.raise_for_status()
+                        data = await response.json()
+                        if "choices" in data and len(data["choices"]) > 0:
+                            return data["choices"][0]["message"]["content"]
+                        elif "base_resp" in data:
+                            raise Exception(f"API Error: {data['base_resp']['status_msg']}")
+                        else:
+                            raise Exception(f"Unexpected response: {data}")
+            except aiohttp.ClientError as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep((2 ** attempt) * 5)
+                    continue
+                raise Exception(f"Network error after {max_retries} attempts: {e}")
+        raise Exception("Max retries exceeded")
 
 
 # Default client - requires LLM_API_KEY environment variable to be set
@@ -73,9 +171,11 @@ FALLBACK_CONTEXT = {
 }
 
 
-def _norm(v: str) -> str:
-    """Normalize and validate a single enum value."""
+def _norm(v: str, valid_set: set = None) -> str:
+    """Normalize a value and validate it against an optional set; return safe fallback if invalid."""
     v = (v or "").strip().upper()
+    if valid_set and v not in valid_set:
+        return "NEUTRAL"  # safe fallback
     return v
 
 
@@ -85,23 +185,17 @@ def _parse_macro_response(raw: str) -> dict:
 
     Schema: {"macro_regime": "...", "btc_strength": "...", "volatility_warning": "..."}
     """
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if not match:
+    start = raw.find('{')
+    end = raw.rfind('}')
+    
+    if start == -1 or end == -1 or end < start:
         raise ValueError("No JSON object found in LLM response")
 
-    parsed = json.loads(match.group())
+    parsed = json.loads(raw[start:end+1])
 
-    macro_regime   = _norm(parsed.get("macro_regime", ""))
-    btc_strength   = _norm(parsed.get("btc_strength", ""))
-    volatility     = _norm(parsed.get("volatility_warning", ""))
-
-    # Enforce enum validity — substitute invalid values with NEUTRAL
-    if macro_regime not in VALID_MACRO_REGIME:
-        macro_regime = "NEUTRAL"
-    if btc_strength not in VALID_BTC_STRENGTH:
-        btc_strength = "NEUTRAL"
-    if volatility not in VALID_VOLATILITY:
-        volatility = "LOW"
+    macro_regime = _norm(parsed.get("macro_regime", ""), VALID_MACRO_REGIME)
+    btc_strength = _norm(parsed.get("btc_strength", ""), VALID_BTC_STRENGTH)
+    volatility   = _norm(parsed.get("volatility_warning", ""), VALID_VOLATILITY)
 
     return {
         "macro_regime":       macro_regime,
@@ -235,9 +329,12 @@ Output ONLY the JSON object. Nothing else. Example valid output:
     try:
         response = llm_client.chat(messages)
         return _parse_macro_response(response)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError) as e:
+        # P0-FIX: _parse_macro_response raises ValueError for missing braces;
+        # catches both error types and safely falls through to FALLBACK_CONTEXT.
+        # Also removed unsafe reference to 'response' variable in exception scope.
         result = dict(FALLBACK_CONTEXT)
-        result["_error"] = f"JSON parse error: {e} | raw: {response[:200]}"
+        result["_error"] = f"Parse error: {type(e).__name__}: {e}"
         return result
     except Exception as e:
         result = dict(FALLBACK_CONTEXT)
@@ -262,6 +359,13 @@ def analyze_market(
     only output macro context via get_llm_macro_context().
     Kept here for backward compatibility with llm_strategy.py.
     """
+    warnings.warn(
+        "analyze_market() is deprecated. "
+        "Use get_llm_macro_context() + WorkflowAnalyzer instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     # Build multi-timeframe section
     tf_section = ""
     if multi_tf:
@@ -384,11 +488,19 @@ Respond in JSON format:
     try:
         response = llm_client.chat(messages)
         # Parse JSON from response
-        # Find JSON in response
-        match = re.search(r'\{.*\}', response, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-        else:
+        start = response.find('{')
+        end = response.rfind('}')
+        if start == -1 or end == -1 or end < start:
             return {"decision": "NO_TRADE", "symbol": "NONE", "risk_level": "MODERATE", "reason": "LLM response parse error"}
-    except Exception as e:
-        return {"decision": "NO_TRADE", "symbol": "NONE", "risk_level": "MODERATE", "reason": f"LLM error: {str(e)}"}
+        parsed = json.loads(response[start:end+1])
+
+        # Validate required fields
+        if parsed.get("decision") not in {"BUY", "SELL", "NO_TRADE"}:
+            return {"decision": "NO_TRADE", "symbol": "NONE", "risk_level": "MODERATE", "reason": "Invalid decision from LLM"}
+        stop_loss = parsed.get("stop_loss")
+        if stop_loss is not None and (not isinstance(stop_loss, (int, float)) or stop_loss <= 0):
+            return {"decision": "NO_TRADE", "symbol": "NONE", "risk_level": "MODERATE", "reason": "Invalid stop_loss from LLM"}
+
+        return parsed
+    except (requests.exceptions.RequestException, json.JSONDecodeError, TypeError, ValueError) as e:
+        return {"decision": "NO_TRADE", "symbol": "NONE", "risk_level": "MODERATE", "reason": f"LLM error: {type(e).__name__}: {e}"}

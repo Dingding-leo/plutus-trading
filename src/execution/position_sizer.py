@@ -25,7 +25,7 @@ def calculate_max_leverage(
     stop_distance: float,
     coin_type: str = "major",
     max_cap: float = 125.0
-) -> float:
+) -> dict:
     """
     Calculate maximum leverage based on stop distance.
 
@@ -35,7 +35,7 @@ def calculate_max_leverage(
         max_cap: Maximum leverage cap (default 125x for major, 50x for small)
 
     Returns:
-        Max leverage as multiple (e.g., 50 for 50x)
+        Dict with 'valid', 'max_leverage', and optionally 'error'.
     """
     buffer = config.LEVERAGE_BUFFERS.get(coin_type, 0.005)
 
@@ -49,13 +49,19 @@ def calculate_max_leverage(
     usable_distance = stop_distance - buffer
 
     if usable_distance <= 0:
-        return 0
+        return {
+            "valid": False,
+            "error": (
+                f"Stop distance {stop_distance:.4f} <= buffer {buffer}. "
+                f"Minimum stop: {buffer + 0.001:.4f}"
+            ),
+        }
 
     # Convert to leverage and cap
     leverage = 1 / usable_distance
     leverage = min(leverage, max_cap)
 
-    return leverage
+    return {"valid": True, "max_leverage": leverage}
 
 
 def calculate_position_size(
@@ -80,6 +86,12 @@ def calculate_position_size(
     Returns:
         Dict with position details
     """
+    if equity <= 0:
+        return {
+            "valid": False,
+            "error": "Invalid equity (must be > 0)",
+        }
+
     if risk_pct is None:
         risk_pct = config.DEFAULT_RISK_PCT
 
@@ -106,7 +118,15 @@ def calculate_position_size(
         max_position = max_cap
 
     # Calculate max leverage
-    max_leverage = calculate_max_leverage(stop_distance, coin_type)
+    leverage_result = calculate_max_leverage(stop_distance, coin_type)
+
+    if not leverage_result.get("valid", False):
+        return {
+            "valid": False,
+            "error": leverage_result.get("error", "Invalid leverage calculation"),
+        }
+
+    max_leverage = leverage_result["max_leverage"]
 
     # Determine recommended leverage (use slightly less than max for safety)
     if max_leverage <= 0:

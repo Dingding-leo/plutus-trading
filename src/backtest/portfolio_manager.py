@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -126,20 +127,18 @@ def calculate_sortino(
 
     # ── Downside deviation: only penalise negative excess returns ─────────────
     excess = returns - target_return          # how much each return missed target
-    downside_returns = excess[excess < 0]     # only the shortfalls
+    downside_squared = np.where(excess < 0, excess**2, 0)
+    downside_variance = np.mean(downside_squared)
 
-    if downside_returns.size == 0:
+    if downside_variance < 1e-12:
         # No downside observed — Sortino undefined, return mean Sharpe as proxy
         std_all = np.std(returns, ddof=1)
         if std_all < 1e-12:
             return 0.0
         periods_per_year = 365.0
-        return float(mean_ret / std_all * math.sqrt(periods_per_year))
+        return float((mean_ret - target_return / periods_per_year) / std_all * math.sqrt(periods_per_year))
 
-    downside_std = np.std(downside_returns, ddof=1)
-
-    if downside_std < 1e-12:
-        return 0.0
+    downside_std = np.sqrt(downside_variance)
 
     periods_per_year = 365.0
     ann_sortino = (mean_ret - target_return / periods_per_year) / downside_std * math.sqrt(periods_per_year)
@@ -204,9 +203,11 @@ def calculate_turnover(
     total_churn = np.sum(deltas)
 
     n_periods = len(positions)
+    if n_periods < 2:
+        return 0.0
 
     # Annualise: average per period × periods per year
-    avg_turnover_per_period = total_churn / n_periods
+    avg_turnover_per_period = total_churn / (n_periods - 1)
     periods_per_year = 365.0
     annualised = avg_turnover_per_period / initial_capital * periods_per_year
 
@@ -291,7 +292,7 @@ def softmax_weights(fitness_scores: np.ndarray, temperature: float = 1.0) -> np.
 
     # Softmax with numerical stability: subtract max before exp
     scores_stable = (scores - np.max(scores)) / temperature
-    exp_scores    = np.exp(scores_stable - np.max(scores_stable))  # stable exp
+    exp_scores    = np.exp(scores_stable)  # stable exp
     weights       = exp_scores / np.sum(exp_scores)
 
     return weights.astype(np.float64)
@@ -306,13 +307,21 @@ class PersonaState:
     Updated incrementally on each event (O(1) per update).
     """
     persona_type:       PersonaType
-    returns_history:    List[float]     = field(default_factory=list)
-    position_history:   List[float]     = field(default_factory=list)
-    trade_count:       int             = 0
+    lookback:           int             = 200
+    returns_history:    deque           = field(default_factory=lambda: deque(maxlen=200))
+    position_history:   deque           = field(default_factory=lambda: deque(maxlen=200))
+    trade_count:        int             = 0
     wins:               int             = 0
     losses:             int             = 0
     fitness_score:      float           = 0.0
     last_signal:        Optional[PersonaSignal] = None
+
+    def __post_init__(self):
+        # Re-initialize deques with the actual lookback value if it differs from default
+        if self.returns_history.maxlen != self.lookback:
+            self.returns_history = deque(self.returns_history, maxlen=self.lookback)
+        if self.position_history.maxlen != self.lookback:
+            self.position_history = deque(self.position_history, maxlen=self.lookback)
 
     @property
     def n_periods(self) -> int:
@@ -337,7 +346,7 @@ class PersonaState:
         """
         self.last_signal = signal
 
-        # Track returns (rolling window managed by DynamicAllocator)
+        # Track returns (deque handles bounded rolling window automatically)
         self.returns_history.append(epoch_return)
 
         # Track position value for turnover calculation
@@ -422,11 +431,8 @@ class DynamicAllocator:
 
         # Per-persona rolling states
         self._states: Dict[PersonaType, PersonaState] = {
-            p: PersonaState(persona_type=p) for p in self.personas
+            p: PersonaState(persona_type=p, lookback=lookback) for p in self.personas
         }
-
-        # Rolling window management (FIFO — O(1) append, bounded memory)
-        self._MAX_HISTORY = lookback * 3  # allow some burst before trimming
 
         # Allocation log
         self._alloc_log: List[AllocatorWeights] = []
@@ -451,15 +457,6 @@ class DynamicAllocator:
             self._states[p].fitness_score for p in self.personas
         ], dtype=np.float64)
 
-    # ── Rolling Window Management ──────────────────────────────────────────────
-
-    def _trim_history(self, state: PersonaState):
-        """Drop oldest entries if rolling window exceeded. O(1) amortised."""
-        if len(state.returns_history) > self._MAX_HISTORY:
-            excess = len(state.returns_history) - self.lookback
-            state.returns_history  = state.returns_history[excess:]
-            state.position_history = state.position_history[excess:]
-
     # ── Metric Recomputation (called periodically, not per update) ──────────────
 
     def recompute_fitness(self, persona: PersonaType) -> float:
@@ -479,8 +476,8 @@ class DynamicAllocator:
             # Not enough history — return current (or 0 for new persona)
             return state.fitness_score
 
-        returns     = np.array(state.returns_history[-self.lookback:], dtype=np.float64)
-        positions   = state.position_history[-self.lookback:]
+        returns     = np.array(list(state.returns_history)[-self.lookback:], dtype=np.float64)
+        positions   = list(state.position_history)[-self.lookback:]
 
         sharpe   = calculate_sharpe(returns)
         sortino  = calculate_sortino(returns)
@@ -533,7 +530,6 @@ class DynamicAllocator:
 
         state = self._states[persona]
         state.update_on_signal(signal, epoch_return, position_value)
-        self._trim_history(state)
         self._epoch += 1
 
     def update_all(
@@ -621,7 +617,7 @@ class DynamicAllocator:
         rows = []
         for persona in self.personas:
             s = self._states[persona]
-            returns_arr = np.array(s.returns_history[-self.lookback:]) if s.returns_history else np.array([])
+            returns_arr = np.array(list(s.returns_history)[-self.lookback:]) if s.returns_history else np.array([])
             rows.append({
                 "persona":          persona.value,
                 "n_periods":        s.n_periods,

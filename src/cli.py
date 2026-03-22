@@ -358,6 +358,10 @@ def cmd_backtest(args):
         print()
         print("Fetching historical data...")
 
+        # Convert date strings to millisecond timestamps
+        start_ms = int(datetime.strptime(start_str, "%Y-%m-%d").timestamp() * 1000)
+        end_ms   = int((datetime.strptime(end_str, "%Y-%m-%d") + td(days=1)).timestamp() * 1000)
+
         # Fetch candles for each symbol
         from .backtest.chronos_engine import ChronosBacktester as CB
         # Run Chronos on each symbol
@@ -365,7 +369,13 @@ def cmd_backtest(args):
             print(f"\nSymbol: {sym}")
             try:
                 market = args.market
-                candles = binance_client.fetch_klines(sym, "1h", 1500, market=market)
+                candles = binance_client.fetch_klines(
+                    sym, "1h",
+                    limit=2000,
+                    market=market,
+                    start_time=start_ms,
+                    end_time=end_ms,
+                )
                 if not candles:
                     print(f"  No data for {sym}")
                     continue
