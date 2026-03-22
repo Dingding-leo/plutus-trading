@@ -5,7 +5,7 @@ Binance API client for fetching OHLCV data.
 import json
 import time
 import os
-from threading import Lock
+import threading
 from typing import Optional, List
 
 import requests
@@ -20,19 +20,121 @@ from .. import config
 class RateLimiter:
     """
     Module-level rate limiter to avoid exceeding Binance API call limits.
-    Enforces a minimum interval between requests across all threads.
+
+    Uses a semaphore + background replenishment thread so that waiting threads
+    do NOT block each other (C2 fix: no lock held during sleep).
     """
-    _lock = Lock()
-    _last_call = 0.0
-    MIN_INTERVAL = 0.2  # 5 calls per second max
+    _sem: threading.Semaphore | None = None
+    _timer: threading.Timer | None = None
+    _lock = threading.Lock()
+    MIN_INTERVAL = 0.2  # seconds — 5 calls / second max
+    _initial_permits = 1  # always maintain exactly 1 available permit
 
     @classmethod
-    def wait(cls):
+    def wait(cls) -> None:
+        # Lazy-init to avoid class-level side-effects at import time
         with cls._lock:
-            elapsed = time.time() - cls._last_call
-            if elapsed < cls.MIN_INTERVAL:
-                time.sleep(cls.MIN_INTERVAL - elapsed)
-            cls._last_call = time.time()
+            if cls._sem is None:
+                cls._sem = threading.Semaphore(cls._initial_permits)
+                cls._start_replenisher()
+        # acquire() blocks only until a permit is available — no sleeping while holding the lock
+        cls._sem.acquire()
+
+    @classmethod
+    def _start_replenisher(cls) -> None:
+        """Background thread that releases one permit every MIN_INTERVAL seconds."""
+        def replenish() -> None:
+            if cls._sem is None:
+                return
+            cls._sem.release()
+            with cls._lock:
+                if cls._timer is not None and cls._timer.is_alive():
+                    cls._timer.cancel()
+                cls._timer = threading.Timer(cls.MIN_INTERVAL, replenish)
+                cls._timer.daemon = True
+                cls._timer.name = "rate_limiter_replenisher"
+                cls._timer.start()
+
+        with cls._lock:
+            if cls._timer is not None and cls._timer.is_alive():
+                cls._timer.cancel()
+            cls._timer = threading.Timer(cls.MIN_INTERVAL, replenish)
+            cls._timer.daemon = True
+            cls._timer.name = "rate_limiter_replenisher"
+            cls._timer.start()
+
+    @classmethod
+    def close(cls) -> None:
+        """Stop the replenisher. Call at application shutdown."""
+        with cls._lock:
+            if cls._timer is not None:
+                cls._timer.cancel()
+                cls._timer = None
+
+
+# ─── Write Rate Limiter (#20) ──────────────────────────────────────────────────
+# Binance enforces stricter limits on write endpoints (order placement, cancellation).
+# Weight-based: POST orders = 1, DELETE orders = 1.
+# Limit: 1200 weights/minute → conservatively target ~600/min (1 permit every 0.1 s).
+#
+# The semaphore is shared across all threads; a background replenisher adds permits
+# so no caller ever blocks indefinitely.
+
+class WriteRateLimiter:
+    """
+    Module-level rate limiter for Binance write (POST / DELETE) endpoints.
+
+    Binance write limit is ~1200 weights/minute.  We target 600 weight-min
+    (1 POST order ≈ 1 weight) to leave headroom, giving a permit every 0.1 s.
+
+    Usage::
+
+        WriteRateLimiter.wait()   # blocks until a permit is available
+        client.place_order(...)
+    """
+    _sem: threading.Semaphore | None = None
+    _timer: threading.Timer | None = None
+    _lock = threading.Lock()
+    MIN_INTERVAL = 0.1           # seconds between write permits (≈ 600/min)
+    _initial_permits = 1
+
+    @classmethod
+    def wait(cls) -> None:
+        with cls._lock:
+            if cls._sem is None:
+                cls._sem = threading.Semaphore(cls._initial_permits)
+                cls._start_replenisher()
+        cls._sem.acquire()
+
+    @classmethod
+    def _start_replenisher(cls) -> None:
+        def replenish() -> None:
+            if cls._sem is None:
+                return
+            cls._sem.release()
+            with cls._lock:
+                if cls._timer is not None and cls._timer.is_alive():
+                    cls._timer.cancel()
+                cls._timer = threading.Timer(cls.MIN_INTERVAL, replenish)
+                cls._timer.daemon = True
+                cls._timer.name = "write_rate_limiter_replenisher"
+                cls._timer.start()
+
+        with cls._lock:
+            if cls._timer is not None and cls._timer.is_alive():
+                cls._timer.cancel()
+            cls._timer = threading.Timer(cls.MIN_INTERVAL, replenish)
+            cls._timer.daemon = True
+            cls._timer.name = "write_rate_limiter_replenisher"
+            cls._timer.start()
+
+    @classmethod
+    def close(cls) -> None:
+        """Stop the replenisher. Call at application shutdown."""
+        with cls._lock:
+            if cls._timer is not None:
+                cls._timer.cancel()
+                cls._timer = None
 
 
 # ─── Valid intervals ────────────────────────────────────────────────────────────
@@ -146,8 +248,15 @@ def fetch_klines(
     all_candles = []
     current_start = start_time
     batch_limit = min(limit, 1000)  # API max is 1000
+    max_iterations = 1000
+    iteration = 0
 
     while True:
+        iteration += 1
+        if iteration > max_iterations:
+            print(f"[WARNING] Pagination hit max_iterations={max_iterations} for {symbol} {interval}. "
+                  "Possible edge case or malformed data. Stopping to prevent infinite loop.")
+            break
         params = {
             "symbol": symbol,
             "interval": interval,
@@ -163,6 +272,20 @@ def fetch_klines(
             try:
                 RateLimiter.wait()
                 response = requests.get(url, params=params, timeout=20)
+
+                # FIX #46: Handle HTTP 429 (rate limit exceeded) with Retry-After backoff.
+                # Binance may return Retry-After (seconds) or Weight-Limit-Exceeded.
+                # Respect the server's backoff signal instead of crashing.
+                if response.status_code == 429:
+                    retry_after = int(response.headers.get("Retry-After", 60))
+                    print(f"[RATE LIMIT] HTTP 429 received. Retrying after {retry_after}s (attempt {attempt + 1}/{retries}).")
+                    if attempt < retries - 1:
+                        time.sleep(retry_after)
+                        continue
+                    else:
+                        raise Exception(f"Rate limit (HTTP 429) persisted after {retries} attempts. "
+                                        "Reduce request frequency or use local data lake.")
+
                 response.raise_for_status()
                 raw_batch = response.json()
                 break
@@ -262,6 +385,8 @@ def get_current_price(symbol: str = "BTCUSDT", market: str = "futures") -> Optio
     params = {"symbol": symbol}
 
     try:
+        # ── #21: Route through RateLimiter to prevent 429 on price queries ──────
+        RateLimiter.wait()
         response = requests.get(url, params=params, timeout=20)
         response.raise_for_status()
         return float(response.json()["price"])

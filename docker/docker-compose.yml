@@ -1,0 +1,239 @@
+version: "3.9"
+
+# =============================================================================
+# Plutus V4.0 — docker-compose.yml
+# =============================================================================
+# Architecture Overview (RT5 fix — proper service separation):
+#
+#   ┌──────────────────────────────────────────────────────────────────────┐
+#   │                        DOCKER NETWORK (plutus_net)                     │
+#   │                                                                       │
+#   │  ┌──────────────┐    XADD    ┌──────────────────┐    xreadgroup       │
+#   │  │   scanner    │──────────▶│   Redis Stream   │──────────────────┐   │
+#   │  │  (BinanceWS) │           │  plutus:scanner  │                  │   │
+#   │  └──────────────┘           │  :orderbook       │                  │   │
+#   │                              └──────────────────┘                  │   │
+#   │                                       ▲                           │   │
+#   │  ┌──────────────┐   PUBLISH          │                           │   │
+#   │  │   engine    │─────────────────────┘                           │   │
+#   │  │  (Plutus)   │                                               │   │
+#   │  └──────┬───────┘                                               │   │
+#   │         │                                                         │   │
+#   │   WebSocket/SSE (push)                                           │   │
+#   │         │                                                         │   │
+#   │  ┌──────▼───────┐    XREADGROUP   ┌──────────────────┐            │   │
+#   │  │    engine    │◀────────────────│  Decision Engine │◀───────────┤   │
+#   │  │  (ScannerWkr)│                 │                  │            │   │
+#   │  └──────────────┘                 └────────┬─────────┘            │   │
+#   │                                             │                      │   │
+#   │                                             ▼                      │   │
+#   │  ┌────────────────┐   route    ┌────────────────────┐              │   │
+#   │  │   execution    │──────────▶│   Binance Exchange │              │   │
+#   │  │     node       │           └────────────────────┘              │   │
+#   │  └────────────────┘                                               │   │
+#   │                                                                       │
+#   │  ┌──────────────┐   ┌──────────────────────────┐                  │
+#   │  │  timescaledb │   │         nginx            │                  │
+#   │  │   (TSDB)      │   │  (WebSocket routing)    │                  │
+#   │  └──────────────┘   └──────────────────────────┘                  │
+#   └──────────────────────────────────────────────────────────────────────┘
+#
+# Inter-Service Communication (RT5 docs):
+#   scanner → Redis Stream XADD (plutus:scanner:stream)
+#       └─ RT1: BinanceWebSocket → XADD with MAXLEN 50_000
+#
+#   engine (IdempotentScannerWorker) → Redis Stream XREADGROUP (plutus-scanner-consumers group)
+#       └─ RT2: Exactly-once semantics; XACK after processing
+#
+#   engine → Redis Pub/Sub (plutus:signals, plutus:decisions)
+#       └─ RT3: Anomaly events published here; consumed by WebSocket/SSE clients
+#
+#   engine → FastAPI → WebSocket / SSE
+#       └─ RT3 fix: No polling — Redis pub/sub is inherently pushed
+#
+#   engine → TimescaleDB (INSERT anomaly + orderbook data)
+#   execution_node → Binance REST/WS API
+#   nginx → route WebSocket connections to plutus_engine
+#
+# RT4 (Redis LRU eviction):
+#   - Scanner streams use XADD with ~MAXLEN 50_000 (set in code).
+#   - Redis maxmemory-policy is set to noeviction for the Redis instance
+#     dedicated to streams (separate from general cache Redis if needed).
+#   - Incoming stream data that would exceed MAXLEN is silently dropped —
+#     acceptable because anomalies are also published to pub/sub for live consumers.
+#
+# RT5 (Docker separation):
+#   - scanner:       Binance WebSocket → Redis Stream producer
+#   - plutus_engine: LLM brain + IdempotentScannerWorker + FastAPI
+#   - execution_node: SmartRouter + BinanceExecutor
+#   - timescaledb:  Historical data persistence
+#   - redis:        Streams + pub/sub hub
+#   - nginx:        WebSocket load balancing / SSL termination
+#
+# =============================================================================
+
+networks:
+  plutus_net:
+    driver: bridge
+
+volumes:
+  plutus_timescale:
+  plutus_redis:
+  plutus_redis_streams:   # separate volume for stream Redis
+
+services:
+
+  # ── Service A: TimescaleDB ──────────────────────────────────────────────────
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: plutus_timescaledb
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-plutus_secret}
+      POSTGRES_USER: ${POSTGRES_USER:-plutus}
+      POSTGRES_DB: ${POSTGRES_DB:-plutus}
+    volumes:
+      - plutus_timescale:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "plutus"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - plutus_net
+
+  # ── Service B: Redis (streams + pub/sub) ───────────────────────────────────
+  # RT4 fix: Use noeviction policy — streams handle their own eviction via MAXLEN
+  redis:
+    image: redis:7-alpine
+    container_name: plutus_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - plutus_redis:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 1gb
+      --maxmemory-policy noeviction
+      --save ""
+    restart: unless-stopped
+    networks:
+      - plutus_net
+
+  # ── Service C: Scanner (Binance WebSocket → Redis Stream) ───────────────────
+  # RT1: This is the producer that bridges Binance WS → Redis stream
+  scanner:
+    build:
+      context: ..
+      dockerfile: docker/scanner.Dockerfile
+    container_name: plutus_scanner
+    depends_on:
+      redis:
+        condition: service_started
+    environment:
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SCANNER_SYMBOLS: "btcusdt,ethusdt,solusdt"
+      SCANNER_CHANNELS: "depth20@100ms,trade"
+    volumes:
+      - ../src:/app/src:ro
+      - ../logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - plutus_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ── Service D: Plutus Engine (LLM Brain + Scanner Worker + FastAPI) ─────────
+  # RT2: Contains IdempotentScannerWorker (xreadgroup consumer)
+  # RT3: FastAPI WebSocket/SSE endpoints
+  plutus_engine:
+    build:
+      context: ..
+      dockerfile: docker/plutus_engine.Dockerfile
+    container_name: plutus_engine
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      LLM_API_KEY: ${LLM_API_KEY:?LLM_API_KEY is required}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o}
+      REDIS_URL: redis://redis:6379
+      TIMESERIES_URL: postgresql://plutus:plutus@timescaledb:5432/plutus
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      WORKER_CONCURRENCY: "4"
+    volumes:
+      - ../src:/app/src:ro
+      - ../logs:/app/logs
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    networks:
+      - plutus_net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── Service E: Execution Node (SmartRouter + BinanceExecutor) ───────────────
+  execution_node:
+    build:
+      context: ..
+      dockerfile: docker/execution_node.Dockerfile
+    container_name: plutus_execution_node
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      BINANCE_API_KEY: ${BINANCE_API_KEY:?BINANCE_API_KEY is required}
+      BINANCE_SECRET: ${BINANCE_SECRET:?BINANCE_SECRET is required}
+      REDIS_URL: redis://redis:6379
+      TIMESERIES_URL: postgresql://plutus:plutus@timescaledb:5432/plutus
+      EXECUTION_MODE: ${EXECUTION_MODE:-test}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ../src:/app/src:ro
+    ports:
+      - "8001:8001"    # execution node health + metrics
+    restart: unless-stopped
+    networks:
+      - plutus_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── Service F: Nginx (WebSocket routing + SSL termination) ──────────────────
+  # RT5: Proper WebSocket load balancing
+  nginx:
+    image: nginx:alpine
+    container_name: plutus_nginx
+    depends_on:
+      - plutus_engine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    restart: unless-stopped
+    networks:
+      - plutus_net

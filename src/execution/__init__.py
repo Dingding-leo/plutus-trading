@@ -23,6 +23,10 @@ from .portfolio_matrix import (
     PairsTrader,
     PortfolioMatrix,
 )
+from .risk_limits import (
+    RiskGuard,
+    RiskLimitExceeded,
+)
 
 __all__ = [
     # position sizer
@@ -45,4 +49,7 @@ __all__ = [
     "RiskManager",
     "PairsTrader",
     "PortfolioMatrix",
+    # risk guard
+    "RiskGuard",
+    "RiskLimitExceeded",
 ]

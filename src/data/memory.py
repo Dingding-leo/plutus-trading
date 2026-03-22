@@ -34,6 +34,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import signal
 import sqlite3
 import threading
 from datetime import datetime
@@ -74,6 +75,7 @@ class MemoryBank:
         pnl: float,
         thesis: str,
         lesson: str,
+        source_mode: str = "DRY_RUN",
     ) -> int:
         """
         Persist a single lesson to the Memory Bank.
@@ -84,6 +86,8 @@ class MemoryBank:
             pnl:          Signed % return (negative = loss, positive = gain)
             thesis:       The LLM persona's stated thesis when entering
             lesson:       1-sentence rule the LLM produced from reflexion
+            source_mode:  "DRY_RUN" or "LIVE". Only LIVE lessons are used for
+                          live trading decisions. Default "DRY_RUN".
 
         Returns:
             The rowid of the newly inserted lesson.
@@ -91,12 +95,16 @@ class MemoryBank:
         if not lesson or not lesson.strip():
             return -1  # No-op for empty lessons
 
+        valid_modes = {"DRY_RUN", "LIVE"}
+        if source_mode not in valid_modes:
+            source_mode = "DRY_RUN"
+
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
                 """
-                INSERT INTO lessons (timestamp, persona, anomaly_type, pnl, thesis, lesson)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO lessons (timestamp, persona, anomaly_type, pnl, thesis, lesson, source_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     datetime.utcnow().isoformat(timespec="seconds"),
@@ -105,6 +113,7 @@ class MemoryBank:
                     float(pnl),
                     thesis.strip(),
                     lesson.strip(),
+                    source_mode,
                 ),
             )
             self._conn.commit()
@@ -115,6 +124,7 @@ class MemoryBank:
         persona: str,
         anomaly_type: str,
         limit: int = 3,
+        source_mode: str = "LIVE",
     ) -> List[str]:
         """
         RAG retrieval: fetch the most recent lessons for a persona + anomaly pair.
@@ -123,6 +133,8 @@ class MemoryBank:
             persona:      Persona name to filter by
             anomaly_type: Anomaly type to filter by
             limit:        Maximum number of lessons to return (default 3)
+            source_mode:  Only return lessons from this source. Set to "LIVE" to
+                          exclude dry-run lessons (default "LIVE").
 
         Returns:
             List of lesson strings, most recent first.
@@ -135,10 +147,11 @@ class MemoryBank:
               FROM lessons
              WHERE persona     = ?
                AND anomaly_type = ?
+               AND source_mode  = ?
              ORDER BY id DESC
              LIMIT ?
             """,
-            (persona.strip(), anomaly_type.strip(), max(1, limit)),
+            (persona.strip(), anomaly_type.strip(), source_mode, max(1, limit)),
         )
         return [row[0] for row in cur.fetchall()]
 
@@ -147,10 +160,17 @@ class MemoryBank:
         personas: List[str],
         anomaly_type: str,
         limit_per: int = 3,
+        source_mode: str = "LIVE",
     ) -> Dict[str, List[str]]:
         """
         Fetch lessons for multiple personas in a single query.
         Returns dict mapping persona -> list of lesson strings.
+
+        Args:
+            personas:     List of persona names to fetch lessons for
+            anomaly_type: Anomaly type to filter by
+            limit_per:    Maximum lessons per persona (default 3)
+            source_mode:  Only return lessons from this source (default "LIVE")
         """
         if not personas:
             return {}
@@ -162,9 +182,10 @@ class MemoryBank:
               FROM lessons
              WHERE persona IN ({placeholders})
                AND anomaly_type = ?
+               AND source_mode  = ?
              ORDER BY id DESC
             """,
-            (*[p.strip() for p in personas], anomaly_type.strip()),
+            (*[p.strip() for p in personas], anomaly_type.strip(), source_mode),
         )
         results: Dict[str, List[str]] = {p: [] for p in personas}
         for persona, lesson in cur.fetchall():
@@ -223,6 +244,120 @@ class MemoryBank:
             cur.execute("SELECT COUNT(*) FROM lessons")
         return cur.fetchone()[0]  # type: ignore[return-value]
 
+    # ── L3: MoEWeighter persistence ─────────────────────────────────────────
+
+    def save_moe_weights(
+        self,
+        weights: Dict[str, float],
+        symbol: str = "BTCUSDT",
+        sharpe_scores: Optional[Dict[str, float]] = None,
+    ) -> None:
+        """
+        Persist the current MoEWeighter weights to the DB.
+
+        This enables the weights to survive process restarts and prevents
+        the per-session reset that was discarding learned weights (L3).
+
+        Args:
+            weights:       {persona: weight} dict from MoEWeighter.get_weights()
+            symbol:        Trading pair (default BTCUSDT)
+            sharpe_scores: {persona: sharpe} optional Sharpe/Sortino scores
+        """
+        import json as _json
+
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS moe_weights (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp    TEXT    NOT NULL,
+                    symbol       TEXT    NOT NULL,
+                    weights      TEXT    NOT NULL,
+                    sharpe_scores TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO moe_weights (timestamp, symbol, weights, sharpe_scores)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    datetime.utcnow().isoformat(timespec="seconds"),
+                    symbol.strip(),
+                    _json.dumps(weights),
+                    _json.dumps(sharpe_scores) if sharpe_scores else None,
+                ),
+            )
+            self._conn.commit()
+
+    # ── L1: Evolved config persistence ──────────────────────────────────────
+
+    def save_evolved_config(
+        self,
+        config_fingerprint: str,
+        config_params: Dict[str, float],
+        generation: int,
+        validation_sharpe: Optional[float] = None,
+        train_sharpe: Optional[float] = None,
+        max_drawdown: Optional[float] = None,
+    ) -> int:
+        """
+        Persist a GA-evolved config so it survives restarts.
+
+        Args:
+            config_fingerprint: Unique string key from GeneticOptimizer._fingerprint()
+            config_params:      Dict of {field_name: value}
+            generation:         GA generation number
+            validation_sharpe:  Sharpe on held-out validation set (walk-forward)
+            train_sharpe:      Sharpe on training set
+            max_drawdown:       Maximum drawdown % on training set
+
+        Returns:
+            The rowid of the inserted config.
+        """
+        import json as _json
+
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS evolved_configs (
+                    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp            TEXT    NOT NULL,
+                    config_fingerprint   TEXT    NOT NULL UNIQUE,
+                    config_params        TEXT    NOT NULL,
+                    generation           INTEGER NOT NULL,
+                    validation_sharpe    REAL,
+                    train_sharpe         REAL,
+                    max_drawdown         REAL,
+                    is_active            INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            # Deactivate all previous configs (only one active at a time)
+            cur.execute("UPDATE evolved_configs SET is_active = 0")
+            cur.execute(
+                """
+                INSERT INTO evolved_configs
+                    (timestamp, config_fingerprint, config_params, generation,
+                     validation_sharpe, train_sharpe, max_drawdown, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    datetime.utcnow().isoformat(timespec="seconds"),
+                    config_fingerprint,
+                    _json.dumps(config_params),
+                    generation,
+                    validation_sharpe,
+                    train_sharpe,
+                    max_drawdown,
+                ),
+            )
+            self._conn.commit()
+            return cur.lastrowid  # type: ignore[return-value]
+
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _init_db(self) -> None:
@@ -251,10 +386,24 @@ class MemoryBank:
                     anomaly_type TEXT    NOT NULL,
                     pnl          REAL    NOT NULL,
                     thesis       TEXT    NOT NULL,
-                    lesson       TEXT    NOT NULL
+                    lesson       TEXT    NOT NULL,
+                    source_mode  TEXT    NOT NULL DEFAULT 'DRY_RUN'
                 )
                 """
             )
+
+            # L6 migration: Add source_mode column to existing tables that lack it.
+            # Only run if the lessons table already existed (pre-L6 schema).
+            # We detect this by checking if the table exists AND lacks source_mode.
+            try:
+                cur.execute("PRAGMA table_info(lessons)")
+                cols = [row[1] for row in cur.fetchall()]
+                if cols and "source_mode" not in cols:
+                    cur.execute(
+                        "ALTER TABLE lessons ADD COLUMN source_mode TEXT NOT NULL DEFAULT 'DRY_RUN'"
+                    )
+            except sqlite3.OperationalError:
+                pass  # Table doesn't exist yet — no migration needed
 
             cur.execute(
                 """
@@ -270,12 +419,115 @@ class MemoryBank:
                 """
             )
 
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_source_mode
+                  ON lessons (source_mode)
+                """
+            )
+
+    def checkpoint(self) -> dict:
+        """
+        S6: Explicitly checkpoint the WAL before graceful shutdown.
+
+        PRAGMA wal_checkpoint(TRUNCATE) writes all WAL frames back to the main
+        DB file and truncates the WAL to zero bytes, ensuring all in-memory
+        writes are durable without requiring a full database close.
+
+        Call this method before:
+          - SIGTERM / SIGINT shutdown handlers
+          - Container stop (Docker stop, Kubernetes SIGTERM)
+          - Any controlled process exit
+
+        Returns
+        -------
+        dict with keys:
+            - success  : bool
+            - message  : str
+            - frames   : int (WAL pages written back)
+            - pages    : int (pages in WAL before checkpoint)
+        """
+        with self._lock:
+            if getattr(self, "_conn", None) is None:
+                return {"success": False, "message": "Not connected", "frames": 0, "pages": 0}
+
+            try:
+                cur = self._conn.cursor()
+                # PASSIVE checkpoint — does not block writers
+                cur.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                result = cur.fetchone()
+                # result: (busy, log_pages, marked_bytes, new_readonly)
+                log_pages = result[1] if result else 0
+
+                if log_pages == 0:
+                    msg = "WAL is clean; no checkpoint needed"
+                    success = True
+                else:
+                    # If WAL is still busy, truncate it (blocking but fast)
+                    cur.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    msg = f"Checkpoint complete; {log_pages} WAL pages written back"
+                    success = True
+
+                logger.debug("[MemoryBank] checkpoint: %s", msg)
+                return {"success": success, "message": msg, "frames": log_pages, "pages": log_pages}
+            except Exception as exc:
+                logger.error("[MemoryBank] checkpoint failed: %s", exc)
+                return {"success": False, "message": str(exc), "frames": 0, "pages": 0}
+
     def close(self):
         """Safely close the SQLite database connection."""
+        self.checkpoint()   # S6: ensure WAL is flushed before closing
         with self._lock:
             if getattr(self, '_conn', None):
                 self._conn.close()
                 self._conn = None
+
+    def register_signal_handler(self) -> None:
+        """
+        S6: Register this MemoryBank instance for graceful checkpoint on shutdown.
+
+        Wires SIGTERM and SIGINT (Ctrl+C) to:
+            1. Call self.checkpoint() to flush the WAL
+            2. Call self.close() to close the DB connection
+        Idempotent: multiple calls are safe (only one handler is registered per
+        signal per process).
+
+        Call this once at application startup when the MemoryBank is the primary
+        persistence layer, e.g.:
+
+            bank = MemoryBank()
+            bank.register_signal_handler()
+
+        The handler logs the checkpoint result before exiting.
+        """
+        def _on_signal(signum: int, _frame) -> None:
+            sig_name = signal.Signals(signum).name
+            logger.info(f"[MemoryBank] Caught {sig_name}; checkpointing before exit...")
+            result = self.checkpoint()
+            logger.info(
+                f"[MemoryBank] Checkpoint result: success={result['success']}  "
+                f"frames={result['frames']}  msg={result['message']}"
+            )
+            self.close()
+            # Re-raise the signal so the default Python handler can exit
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            # Only register if no handler is already set (or if it's default/ignore)
+            old = signal.signal(sig, signal.SIG_DFL)
+            if old not in (signal.SIG_DFL, signal.SIG_IGN):
+                # A custom handler already exists; don't override
+                signal.signal(sig, old)
+                logger.warning(
+                    "[MemoryBank] SIG%s already has a custom handler; "
+                    "skipping MemoryBank registration. "
+                    "Call bank.checkpoint() manually in your existing handler.",
+                    signal.Signals(sig).name,
+                )
+            else:
+                signal.signal(sig, _on_signal)
+                logger.info(f"[MemoryBank] Registered {sig.name} checkpoint handler")
 
     def __enter__(self):
         return self

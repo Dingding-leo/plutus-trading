@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import functools
 import json
+import threading
+import time
 from pathlib import Path
 from typing import List, Dict
 
@@ -14,24 +16,59 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-# ─── Cache decorator (Streamlit-aware) ──────────────────────────────────────
+# ─── Cache decorator (Streamlit-aware, true TTL) ────────────────────────────
 
 try:
     import streamlit as st
-    _cache = functools.lru_cache(maxsize=4)
-    # Wrap @lru_cache so the signature matches @st.cache_data(ttl=...)
-    def _cached(ttl=3600):
-        return _cache
     _USE_STREAMLIT = True
 except ModuleNotFoundError:
     _USE_STREAMLIT = False
 
+# Thread-safe TTL cache shared across all decorated functions.
+_ttl_cache: dict = {}
+_ttl_timestamps: dict = {}
+_ttl_lock = threading.RLock()
+
+
+def _invalidate_ttl_cache():
+    """Clear all TTL cache entries. Call this when underlying data changes."""
+    with _ttl_lock:
+        _ttl_cache.clear()
+        _ttl_timestamps.clear()
+
+
+def _make_ttl_decorator(ttl: int):
+    """
+    Return a decorator that implements genuine time-to-live (TTL) caching.
+    Each decorated function gets its own namespace in the shared dict so that
+    distinct functions (and distinct argument tuples) are cached independently.
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            # Build a cache key that includes function identity AND call arguments.
+            key = (id(fn), args, tuple(sorted(kwargs.items())))
+            with _ttl_lock:
+                ts = _ttl_timestamps.get(key)
+                if ts is not None and (time.monotonic() - ts) < ttl:
+                    return _ttl_cache[key]
+                # Cache miss or stale — call function and store result.
+                result = fn(*args, **kwargs)
+                _ttl_cache[key] = result
+                _ttl_timestamps[key] = time.monotonic()
+                return result
+        return wrapper
+    return decorator
+
 
 def _cache_decorator(ttl=3600):
-    """@st.cache_data when in Streamlit, @functools.lru_cache otherwise."""
+    """
+    @st.cache_data(ttl=N) when running inside Streamlit (Streamlit handles TTL
+    invalidation internally); a true TTL dict-cache otherwise.
+    """
     if _USE_STREAMLIT:
         return st.cache_data(ttl=ttl)
-    return functools.lru_cache(maxsize=4)
+    return _make_ttl_decorator(ttl=ttl)
 
 
 # ─── Core loaders ─────────────────────────────────────────────────────────────

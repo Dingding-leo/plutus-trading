@@ -7,9 +7,14 @@ Fetches news from multiple sources:
 - CoinGecko Fear & Greed Index
 """
 
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, TYPE_CHECKING
 from datetime import datetime, timedelta
 from dataclasses import dataclass
+
+# Local exchange to avoid circular import with coingecko_client.
+# Imported at module level (not inside a function) so the dependency is
+# resolved once at import time rather than dynamically on first call.
+from . import coingecko_client
 
 
 @dataclass
@@ -135,7 +140,6 @@ class NewsService:
 
     def get_fear_greed(self) -> Optional[dict]:
         """Get Fear & Greed Index."""
-        from . import coingecko_client
         return coingecko_client.get_fear_greed_index()
 
     # ─────────────────────────────────────────────────────────

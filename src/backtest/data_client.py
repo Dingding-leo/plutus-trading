@@ -2,16 +2,43 @@
 Unified data client for backtesting - supports both OKX and Binance with proper historical fetching.
 """
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 import requests
 import time
 import os
 import json
+import math
 
 from .. import config
 from ..data import binance_client
 from ..data.coin_tiers import normalize_symbol
+
+
+# ─── Timeframe helpers ──────────────────────────────────────────────────────────
+
+def _interval_to_ms(interval: str) -> int:
+    """Convert interval string (e.g. '1h', '5m', '1d') to milliseconds."""
+    multipliers = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+    unit = interval[-1]
+    value = int(interval[:-1])
+    return value * multipliers.get(unit, 1) * 1000
+
+
+def _floor_to_complete_candle(ts_ms: int, interval: str) -> int:
+    """
+    Floor a timestamp to the start of its containing complete candle.
+
+    CRITICAL: Never pass datetime.now() directly as end_ts — always floor to the
+    last COMPLETE candle to avoid look-ahead bias. Backtests must never "see"
+    candles whose close_time is in the future or equal to the current moment.
+    """
+    interval_ms = _interval_to_ms(interval)
+    return (ts_ms // interval_ms) * interval_ms
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 # Binance API headers (required for fapi endpoints)
 BINANCE_HEADERS = {
@@ -45,25 +72,44 @@ class DataClient:
         normalized = normalize_symbol(symbol)
         return os.path.join(CACHE_DIR, f"{normalized}_{timeframe}_{market}.json")
 
-    def _load_from_cache(self, symbol: str, timeframe: str, start_ts: int, end_ts: int, market: str = "futures") -> List[dict]:
+    def _load_from_cache(self, symbol: str, timeframe: str, start_ts: int, end_ts: int, market: str = "futures") -> Optional[List[dict]]:
         cache_path = self._get_cache_path(symbol, timeframe, market)
         if not os.path.exists(cache_path):
             return None
         try:
             with open(cache_path, 'r') as f:
                 data = json.load(f)
-            filtered = [c for c in data if start_ts <= c['timestamp'] <= end_ts]
-            return filtered
+
+            # FIX #42: Never serve candles whose close_time has not yet passed.
+            # The Binance API returns the current (incomplete) candle on every request.
+            # Serving it from cache poisons backtests with look-ahead bias.
+            # Filter out any candle where close_time >= current time.
+            now_ms = _now_ms()
+            interval_ms = _interval_to_ms(timeframe)
+            # The "safe" boundary is the start of the current (potentially incomplete) candle.
+            candle_boundary = _floor_to_complete_candle(now_ms, timeframe)
+            # Only keep candles whose open_time ends before the current incomplete candle.
+            filtered = [
+                c for c in data
+                if start_ts <= c.get('timestamp', 0) <= end_ts
+                and c.get('timestamp', 0) < candle_boundary
+            ]
+            return filtered if filtered else None
         except Exception:
             return None
 
     def _save_to_cache(self, symbol: str, timeframe: str, data: List[dict], market: str = "futures"):
         if not self.use_cache:
             return
+        # FIX #42 (save path): Strip any incomplete candles before persisting to disk.
+        # This ensures cached data is always "clean" for future backtests.
+        now_ms = _now_ms()
+        candle_boundary = _floor_to_complete_candle(now_ms, timeframe)
+        clean_data = [c for c in data if c.get('timestamp', 0) < candle_boundary]
         cache_path = self._get_cache_path(symbol, timeframe, market)
         try:
             with open(cache_path, 'w') as f:
-                json.dump(data, f)
+                json.dump(clean_data, f)
         except Exception:
             pass
 
@@ -115,7 +161,11 @@ class DataClient:
             end_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
             end_ts = int(end_dt.timestamp() * 1000)
         else:
-            end_ts = int(datetime.now().timestamp() * 1000)
+            # FIX #41: Floor end_ts to the last COMPLETE candle boundary.
+            # Using now() directly introduces look-ahead bias: the backtest would
+            # accidentally include the current incomplete candle, whose close price
+            # is not yet settled. Always floor to the completed period.
+            end_ts = _floor_to_complete_candle(_now_ms(), timeframe)
 
         if start_date:
             start_ts = int(datetime.strptime(start_date, "%Y-%m-%d").timestamp() * 1000)
@@ -338,7 +388,32 @@ def get_all_okx_futures() -> List[str]:
         return []
 
 
-# All common futures - NO HYPHEN format (Binance standard)
+# ─── Survivorship Bias Configuration ────────────────────────────────────────────
+#
+# CRITICAL BUG (#6): COMMON_FUTURES excludes delisted/collapsed assets.
+# This creates SURVIVORSHIP BIAS: backtests only see assets that survived to today.
+#
+# Impact:
+# - Assets that collapsed (e.g., LUNA, FTX tokens, Luna Classic) are absent.
+# - Assets that were delisted mid-period (e.g., older altcoins) are absent.
+# - Win rates and Sharpe ratios are inflated because only "successful" assets
+#   survive in the dataset.
+#
+# Set INCLUDE_HISTORICAL_ASSETS=True to use the full historical universe
+# (including assets that no longer trade). This requires a historical data
+# provider that preserves delisted symbols (e.g., CoinAPI, Kaiko, or a
+# self-maintained dataset that stores historical ticker data).
+#
+# When INCLUDE_HISTORICAL_ASSETS=False (default), this list is restricted to
+# assets currently trading on Binance — backtests are representative of
+# TODAY's available universe, not the historical universe.
+# ─────────────────────────────────────────────────────────────────────────────
+INCLUDE_HISTORICAL_ASSETS: bool = False
+
+# All common futures - NO HYPHEN format (Binance standard).
+# NOTE: This list only includes assets that are STILL TRADING today.
+# If INCLUDE_HISTORICAL_ASSETS=True, also query get_all_okx_futures() at
+# runtime and union the results to capture assets that have since been delisted.
 COMMON_FUTURES = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "XRPUSDT",
     "ADAUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT", "LINKUSDT",

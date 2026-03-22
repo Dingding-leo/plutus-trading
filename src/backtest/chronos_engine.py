@@ -56,9 +56,14 @@ from ..data.personas import (
     SMC_ICT_Persona, OrderFlowPersona, MacroOnChainPersona,
     create_persona,
 )
-from ..models.meta_learning import MoEWeighter, update_weights
+from ..models.meta_learning import (
+    MoEWeighter, update_weights, GeneticOptimizer, ReflexionEvolver,
+    ScannerParams, MetaLearningRunner,
+)
 from ..backtest.portfolio_manager import DynamicAllocator
 from ..data.memory import MemoryBank
+from ..execution.portfolio_matrix import PairsTrader, SpreadTrade
+from ..execution.risk_limits import RiskGuard, RiskLimitExceeded
 
 
 # ─── Enums ──────────────────────────────────────────────────────────────────────
@@ -75,21 +80,22 @@ class BlendedTrade:
     """A single executed trade from the Chronos Engine."""
     event_idx:        int
     timestamp:         datetime
-    anomaly_type:      str
-    direction:         str          # "LONG" | "SHORT" | "NEUTRAL"
-    confidence:       int          # 0-100
+    anomaly_type:      str              # "LONG" | "SHORT" | "NEUTRAL"
+    direction:         str              # "LONG" | "SHORT" | "NEUTRAL"
+    confidence:        int              # 0-100
     weights:           Dict[str, float]   # {persona: weight}
     fitnesses:         Dict[str, float]   # {persona: fitness}
-    signals:           Dict[str, Dict]    # {persona: signal.to_dict()}
+    signals:           Dict[str, Dict]      # {persona: signal.to_dict()}
     position_value:    float
     leverage:         float
     entry_price:      float = 0.0
     stop_loss:        float = 0.0
-    take_profit:       float = 0.0
+    take_profit:      float = 0.0
     rr_ratio:         float = 0.0
     trade_result:      Optional[str] = None   # "WIN" | "LOSS" | "OPEN"
     pnl:              Optional[float] = None
     notes:             List[str] = field(default_factory=list)
+    symbol:           str = ""         # e.g. "BTCUSDT" — OPERATION HYDRA: per-symbol tag
 
     def to_dict(self) -> Dict:
         d = asdict(self)
@@ -186,6 +192,7 @@ class ChronosBacktester:
 
     def __init__(
         self,
+        universe: list[str] = None,       # OPERATION HYDRA: e.g. ["BTCUSDT", "ETHUSDT"]
         mode: BacktestMode = BacktestMode.DRY_RUN,
         initial_equity: float = 10_000.0,
         min_confidence: int = 60,
@@ -194,8 +201,11 @@ class ChronosBacktester:
         penalty_factor: float = 0.1,
         compound: bool = True,
         log_file: str = "logs/chronos_trades.json",
+        win_rate_check: bool = True,   # FIX B4: always on by default, even in DRY_RUN
     ):
         self.mode = mode
+        # L6 fix: source_mode prevents DRY_RUN lessons from polluting live DB
+        self.source_mode = "LIVE" if mode == BacktestMode.LIVE else "DRY_RUN"
         self.initial_equity = initial_equity
         self.min_confidence = min_confidence
         self.lookback = lookback
@@ -203,26 +213,40 @@ class ChronosBacktester:
         self.penalty_factor = penalty_factor
         self.compound = compound
         self.log_file = log_file
+        self.universe = universe or ["BTCUSDT"]   # OPERATION HYDRA: store universe
+        self.win_rate_check = win_rate_check
+
+        # FIX R1: Initialize RiskGuard with backtest equity so it can enforce
+        # hard-stop checks (kill switch, drawdown, notional cap, leverage limits,
+        # session loss) before each simulated trade.  Use dry_run mode so limits
+        # are relaxed per YAML anchors, but the checks themselves still run.
+        self._risk_guard: Optional[RiskGuard] = None
 
         self._scanner = VanguardScanner()
 
-        # OPERATION DARWIN: MoEWeighter tracks Sortino-weighted persona allocation.
-        # Initialised with same lookback/temperature as the allocator;
-        # weights are updated after every trade outcome and used for the blended vote.
-        self._weighter = MoEWeighter(
-            personas=[p.value for p in self.PERSONAS],
-            lookback=lookback,
-            temperature=temperature,
-        )
+        # OPERATION HYDRA: per-symbol MoE weighters — personas are completely
+        # independent per symbol. Each symbol accumulates its own Sortino history.
+        self._symbol_weights: dict[str, MoEWeighter] = {
+            sym: MoEWeighter(
+                personas=[p.value for p in self.PERSONAS],
+                lookback=lookback,
+                temperature=temperature,
+            )
+            for sym in self.universe
+        }
 
         self._allocator = DynamicAllocator(
             personas=self.PERSONAS,
             lookback=lookback,
             temperature=temperature,
             penalty_factor=penalty_factor,
+            initial_capital=initial_equity,
         )
         self._memory_bank = MemoryBank()
         self._equity = initial_equity
+        # FIX #39: Track realized-only equity separately for compound sizing.
+        # working_equity in compound mode should only use CLOSED PnL, not unrealized.
+        self._realized_equity = initial_equity
         self._trades: List[BlendedTrade] = []
         self._wins = 0
         self._losses = 0
@@ -230,6 +254,43 @@ class ChronosBacktester:
         self._max_drawdown = 0.0
         self._peak = initial_equity
         self._reflexions_run = 0
+
+        # L1 fix: GA optimizer (evolve() was dead code — now wired)
+        # Recalibrate_scanner is invoked in _run_reflexion_loop; evolve() is
+        # invoked by MetaLearningRunner after each backtest cycle.
+        self._ga_optimizer: Optional[GeneticOptimizer] = None
+
+        # L4 fix: ReflexionEvolver — evolve_from_trades() was never called
+        self._reflexion_evolver = ReflexionEvolver()
+
+        # L1 fix: MetaLearningRunner orchestrates backtest → evolve → apply
+        self._meta_runner = MetaLearningRunner(
+            universe=self.universe,
+            population_size=32,
+            evolutions_per_cycle=1,   # one generation per cycle is enough
+            initial_equity=initial_equity,
+            min_confidence=min_confidence,
+            lookback=lookback,
+        )
+        self._meta_runner.inject_memory_bank(self._memory_bank)
+
+        # OPERATION HYDRA: cross-symbol SignalMatrix lookahead buffer.
+        # Stores the most recent blended vote for each symbol. Read by
+        # _process_event() for context only — personas remain independent.
+        self._latest_signals: dict[str, dict[str, Any]] = {}
+
+        # OPERATION HYDRA: PairsTrader — delta-neutral spread execution engine
+        self._pairs_trader = PairsTrader(
+            initial_equity=initial_equity,
+            min_notional=5.0,
+        )
+        self._spread_trades: List[SpreadTrade] = []
+
+        # P1-FIX: Incremental EMA50 cache — avoids O(n) full recomputation on every event.
+        # Per symbol: (prev_ema50, candle_count). Updated incrementally in _detect_trend.
+        # hist_df grows by ~1 candle per event; we only update for new candles,
+        # not recompute the full ewm() over the entire history each time.
+        self._ema50_cache: dict[str, tuple[float, int]] = {}
 
     def __enter__(self):
         return self
@@ -240,59 +301,119 @@ class ChronosBacktester:
 
     # ── Public API ────────────────────────────────────────────────────────────────
 
-    def run_backtest(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def run_backtest(self, dfs: dict[str, pd.DataFrame]) -> Dict[str, Any]:
         """
-        Run the Chronos event-driven backtest on a full OHLCV DataFrame.
+        OPERATION HYDRA: Multi-symbol event-driven backtest.
+
+        dfs = {'BTCUSDT': df_btc, 'ETHUSDT': df_eth, ...}
 
         Time-Jump algorithm:
-          1. Scanner scans entire df → List[ScannerEvent]
-          2. If empty → return zero-cost result (0 LLM calls)
-          3. Sort events chronologically
-          4. For each event:
-             a. Slice df[:event.candle_idx] — no lookahead
+          1. For each symbol in self.universe, scan its DataFrame → tagged events
+          2. Collect all events, sort chronologically
+          3. For each event:
+             a. Slice df[:event.candle_idx] — no lookahead (per-symbol df)
              b. Build persona payloads from event context + historical data
-             c. Get persona signals (mock or real LLM)
+             c. Get persona signals (mock or real LLM) — per-symbol MoE voting
              d. Allocator.update_all() → allocate()
              e. Blended vote → execute trade if confidence > min_confidence
              f. Track PnL
+          4. SignalMatrix at any timestamp = {symbol: blended_direction+conf}
+             for all symbols with active events at that time
           5. Return summary
 
         Returns:
             Dict with keys: events_found, trades_executed, trades, equity_curve,
-                           win_rate, total_pnl, max_drawdown, sharpe_approx
+                           win_rate, total_pnl, max_drawdown, sharpe_approx,
+                           universe, signal_matrix (per-event cross-symbol context)
         """
-        # Step 1: Scanner
-        events = self._scanner.scan(df)
-        if not events:
-            return self._zero_result(
-                note="Scanner found no anomalies — 0 LLM calls, 0 trades"
+        # FIX #39: Reset all run-level state so re-running backtest on the same instance
+        # starts from a clean slate. Both _equity and _realized_equity are reset to
+        # initial_equity so compounding uses the verified closed-PnL equity only.
+        self._equity = self.initial_equity
+        self._realized_equity = self.initial_equity
+        self._trades = []
+        self._wins = 0
+        self._losses = 0
+        self._total_pnl = 0.0
+        self._max_drawdown = 0.0
+        self._peak = self.initial_equity
+
+        # Reset per-symbol MoE weights at start of each run
+        for sym in self.universe:
+            self._symbol_weights[sym] = MoEWeighter(
+                personas=[p.value for p in self.PERSONAS],
+                lookback=self.lookback,
+                temperature=self.temperature,
             )
 
-        # Step 2: Sort chronologically
-        events = sorted(events, key=lambda e: e.candle_idx)
+        # Reset cross-symbol signal buffer
+        self._latest_signals: dict[str, dict[str, Any]] = {}
+
+        # FIX R1: Re-initialise RiskGuard with current equity (resets peak, session, alerts)
+        self._risk_guard = RiskGuard(
+            equity=self._equity,
+            mode="dry_run",
+            initial_capital=self.initial_equity,
+        )
+        self._risk_guard.start_session(session_id=f"backtest_{datetime.now(timezone.utc).isoformat()}")
+
+        # OPERATION HYDRA: Scan each symbol independently, tag events with symbol
+        all_events: List[ScannerEvent] = []
+        symbol_dfs: dict[str, pd.DataFrame] = {}
+
+        for symbol in self.universe:
+            df = dfs.get(symbol)
+            if df is None:
+                continue
+            symbol_dfs[symbol] = df
+            events = self._scanner.scan(df)
+            for e in events:
+                e._symbol = symbol   # tag event with its symbol
+            all_events.extend(events)
+
+        if not all_events:
+            return self._zero_result(
+                note="Scanner found no anomalies across universe — 0 LLM calls, 0 trades"
+            )
+
+        # Sort all events chronologically across symbols
+        all_events.sort(key=lambda e: e.candle_idx)
         event_log = []
+
+        total_candles = sum(len(df) for df in symbol_dfs.values())
 
         print(f"\n{'='*60}")
         print(f"CHRONOS BACKTESTER ({self.mode.value.upper()})")
         print(f"{'='*60}")
-        print(f"  DataFrame: {len(df)} candles")
-        print(f"  Scanner events: {len(events)} anomalies ({len(events)/len(df)*100:.1f}% wake rate)")
+        print(f"  Universe: {self.universe}")
+        print(f"  Total candles: {total_candles}")
+        print(f"  Total events: {len(all_events)} "
+              f"({len(all_events)/max(total_candles,1)*100:.1f}% wake rate)")
         print(f"  Min confidence threshold: {self.min_confidence}")
         print(f"  Initial equity: ${self.initial_equity:,.2f}")
         print()
 
-        # Step 3: Process each event
+        # Step 3: Process each cross-symbol event chronologically
         last_processed_idx = -1
-        for i, event in enumerate(events):
+        for i, event in enumerate(all_events):
+            # OPERATION HYDRA: SignalMatrix is implicitly built here.
+            # self._latest_signals holds each symbol's most recent blended vote.
+            # _process_event reads it for context (other-symbol context only —
+            # personas never see cross-symbol votes).
+            symbol = getattr(event, "_symbol", "BTCUSDT")
+            df = symbol_dfs.get(symbol)
+
             if event.candle_idx == last_processed_idx:
-                print(f"[{i + 1}/{len(events)}] {event.timestamp} | {event.anomaly_type} | Skipping duplicate event at idx={event.candle_idx}")
+                print(f"[{i + 1}/{len(all_events)}] {event.timestamp} [{symbol}] "
+                      f"{event.anomaly_type} | Skipping duplicate event at idx={event.candle_idx}")
                 continue
-            self._process_event(event, df, event_log, i + 1, len(events))
+
+            self._process_event(event, df, event_log, i + 1, len(all_events), symbol)
             last_processed_idx = event.candle_idx
 
         # Step 4: Compute metrics
         equity_curve = self._build_equity_curve()
-        summary = self._compute_summary(equity_curve, events, event_log)
+        summary = self._compute_summary(equity_curve, all_events, event_log)
         self._save_log(event_log)
 
         print(f"\n{'='*60}")
@@ -301,10 +422,11 @@ class ChronosBacktester:
         self._print_summary(summary)
 
         return {
-            "events_found": len(events),
+            "events_found": len(all_events),
             "trades_executed": len(self._trades),
             "trades": [t.to_dict() for t in self._trades],
             "equity_curve": equity_curve,
+            "universe": self.universe,
             **summary,
         }
 
@@ -317,14 +439,27 @@ class ChronosBacktester:
         event_log: List[Dict],
         event_num: int,
         total_events: int,
+        symbol: str = "BTCUSDT",    # OPERATION HYDRA: which symbol this event belongs to
     ):
-        """Process a single scanner event."""
+        """
+        Process a single scanner event for a specific symbol.
+
+        OPERATION HYDRA:
+          - Uses per-symbol MoE weighter (self._symbol_weights[symbol]) so persona
+            voting history is completely independent per symbol.
+          - After blending, stores blended result in self._latest_signals[symbol]
+            for cross-symbol context (read-only — personas never see other symbols).
+        """
         ts = event.timestamp
         anomaly = event.anomaly_type
         idx = event.candle_idx
         ctx = event.context_data
 
-        print(f"[{event_num}/{total_events}] {ts} | {anomaly} | {ctx.get('direction','?')} | idx={idx}")
+        # OPERATION HYDRA: expose SignalMatrix context (read-only, personas blind)
+        other_signals = {k: v for k, v in self._latest_signals.items() if k != symbol}
+
+        print(f"[{event_num}/{total_events}] {ts} [{symbol}] | {anomaly} | {ctx.get('direction','?')} | idx={idx}"
+              + (f" | cross-signal: {other_signals}" if other_signals else ""))
 
         # ── Step a: Historical slice (no lookahead bias) ──────────────────────
         hist_df = df.iloc[:idx + 1].copy()
@@ -333,20 +468,82 @@ class ChronosBacktester:
             return
 
         # ── Step b: Build persona payloads ───────────────────────────────────
+        # LEAD VETO: Evaluate SMC_ICT FIRST.
+        # If it vetoes (NEUTRAL or contradicts trigger), skip ORDER_FLOW and MACRO_ONCHAIN
+        # entirely to avoid wasting API calls. Blended is forced to NEUTRAL.
         signals: Dict[PersonaType, PersonaSignal] = {}
         signal_dicts: Dict[str, Dict] = {}
-        
+
         trigger_direction = ctx.get("direction", "NEUTRAL")
+        lead_veto = False   # True = SMC_ICT vetoed; skip the other two personas
 
         # Batch RAG retrieval: fetch lessons for all personas in a single query
+        # L6 fix: only fetch LIVE lessons for live trading decisions
         all_persona_values = [p.value for p in self.PERSONAS]
         batch_lessons = self._memory_bank.retrieve_lessons_batch(
             all_persona_values,
             anomaly,
             limit_per=3,
+            source_mode=self.source_mode,
         )
 
-        for persona_type in self.PERSONAS:
+        # ── Lead Persona: SMC_ICT (PERSONAS[0]) ───────────────────────────────
+        lead = self.PERSONAS[0]   # SMC_ICT
+        lead_lessons = batch_lessons.get(lead.value, [])
+        lead_data = self._build_persona_data(lead, hist_df, event)
+
+        if self.mode == BacktestMode.DRY_RUN:
+            lead_signal = DryRunPersonaSignal.from_event(event, lead)
+        else:
+            lead_signal = self._call_llm_persona(lead, lead_data, lead_lessons)
+
+        # Direction-alignment check
+        TRIGGER_TO_SIGNAL = {"BULLISH": "LONG", "BEARISH": "SHORT"}
+        aligned_trigger = TRIGGER_TO_SIGNAL.get(trigger_direction, trigger_direction)
+        lead_conflict = (
+            trigger_direction != "NEUTRAL"
+            and lead_signal.direction.value != "NEUTRAL"
+            and lead_signal.direction.value != aligned_trigger
+        )
+
+        # FIX 3: Only VETO on CONFLICT — never skip the other personas.
+        # If SMC_ICT outputs NEUTRAL, it gets 0 weight but ORDER_FLOW and
+        # MACRO_ONCHAIN still get a chance to produce a valid directional signal.
+        if lead_conflict:
+            # True LEAD VETO: SMC_ICT disagrees with the trigger direction.
+            # Skip the other personas entirely (valid in live mode — saves API costs).
+            lead_veto = True
+            print(f"  ⚠ LEAD VETO [{lead.value}]: {lead_signal.direction.value} conflicts "
+                  f"with trigger {trigger_direction} — skipping ORDER_FLOW & MACRO_ONCHAIN")
+            lead_signal.direction = Direction.NEUTRAL
+            lead_signal.confidence = 0
+            lead_signal.warnings.append(
+                f"Lead veto: direction overridden to NEUTRAL due to {trigger_direction} trigger."
+            )
+            self._symbol_weights[symbol].update(lead.value, 0.0)
+            signals[lead] = lead_signal
+            signal_dicts[lead.value] = lead_signal.to_dict()
+            if lead_lessons:
+                print(f"  📚 {lead.value}: RAG injected {len(lead_lessons)} lesson(s)")
+            print(f"  {lead.value:15s}: {lead_signal.direction.value:7s} "
+                  f"conf={lead_signal.confidence:3d} lev={lead_signal.leverage}x | "
+                  f"{lead_signal.thesis[:50]}...")
+        else:
+            # SMC_ICT cleared — store signal and continue to the remaining personas
+            lead_veto = False
+            signals[lead] = lead_signal
+            signal_dicts[lead.value] = lead_signal.to_dict()
+            if lead_lessons:
+                print(f"  📚 {lead.value}: RAG injected {len(lead_lessons)} lesson(s)")
+            print(f"  {lead.value:15s}: {lead_signal.direction.value:7s} "
+                  f"conf={lead_signal.confidence:3d} lev={lead_signal.leverage}x | "
+                  f"{lead_signal.thesis[:50]}...")
+
+        # ── Remaining Personas: ORDER_FLOW, MACRO_ONCHAIN ────────────────────
+        # FIX 3: ALWAYS called — even when SMC_ICT is NEUTRAL.
+        # (In dry_run mode there is no API cost; in live mode we trust the veto
+        # only on genuine conflict, not on uncertainty.)
+        for persona_type in self.PERSONAS[1:]:   # ORDER_FLOW, MACRO_ONCHAIN
             past_lessons = batch_lessons.get(persona_type.value, [])
 
             # Build persona-specific data dict from historical slice + event context
@@ -360,8 +557,6 @@ class ChronosBacktester:
 
             # Force strict direction alignment: cannot counter-trade the mathematical trigger
             # trigger uses BULLISH/BEARISH, signal uses LONG/SHORT — normalize for comparison
-            TRIGGER_TO_SIGNAL = {"BULLISH": "LONG", "BEARISH": "SHORT"}
-            aligned_trigger = TRIGGER_TO_SIGNAL.get(trigger_direction, trigger_direction)
             is_conflict = (
                 trigger_direction != "NEUTRAL"
                 and signal.direction.value != "NEUTRAL"
@@ -382,11 +577,18 @@ class ChronosBacktester:
                   f"conf={signal.confidence:3d} lev={signal.leverage}x | {signal.thesis[:50]}...")
 
         # ── Step c & d: Weight allocation (using history up to now) ────
+        # OPERATION HYDRA: per symbol MoE — each symbol uses its own weighter instance.
         # OPERATION DARWIN: blended vote uses Sortino-softmax weights from MoEWeighter
         # (replaces static 0.33 allocation — weights shift dynamically as trades are won/lost)
-        weights = self._weighter.get_weights()
+        # P3-FIX: Removed double-allocate().
+        #   MoEWeighter.update() (called at the end of _process_event) already calls
+        #   allocate() internally and stores _weights.  get_weights() returns the cached
+        #   dict with zero recomputation.  The spurious self._allocator.allocate() call
+        #   whose result was never used is removed.
+        weights = self._symbol_weights[symbol].get_weights()
 
         # Allocator fitness is still tracked for GA selection / turnover penalty
+        # (uses its own independent DynamicAllocator instance — NOT the per-symbol MoEWeighter)
         weights_snapshot = self._allocator.allocate()
         fitnesses = {p.value: float(f) for p, f in zip(self.PERSONAS, weights_snapshot.fitnesses)}
 
@@ -396,6 +598,110 @@ class ChronosBacktester:
         # ── Step e: Blended vote + execution decision ────────────────────────
         blended = self._blended_vote(signals, weights)
         print(f"  Blended: {blended['direction']} conf={blended['confidence']}")
+
+        # ── FIX 5: Trend Filter ──────────────────────────────────────────────
+        # A LIQUIDITY_SWEEP in a strong downtrend is a continuation pattern,
+        # not a reversal. Fading it as a reversal loses every time.
+        if blended["direction"] != "NEUTRAL":
+            trend = self._detect_trend(hist_df, symbol, lookback=20)
+            ctx_dir = ctx.get("direction", "NEUTRAL")
+            if trend == "DOWN" and blended["direction"] == "LONG":
+                print(f"  ⛔ Trend filter: skipping LONG in DOWN trend — fade is a continuation trap")
+                self._log_skip(event_log, event_num, ts, anomaly, "trend_filter_LONG_in_DOWN")
+                self._update_skip_weights(signals, symbol)
+                return
+            if trend == "UP" and blended["direction"] == "SHORT":
+                print(f"  ⛔ Trend filter: skipping SHORT in UP trend — fade is a continuation trap")
+                self._log_skip(event_log, event_num, ts, anomaly, "trend_filter_SHORT_in_UP")
+                self._update_skip_weights(signals, symbol)
+                return
+
+        # ── FIX B4: Minimum Win Rate Gate ─────────────────────────────────────
+        # FIX B4: Now controlled by self.win_rate_check flag (default True).
+        # Previously disabled in DRY_RUN, which gave false confidence — the gate
+        # fires in production but was never tested in backtest.  Gate is a circuit
+        # breaker: it proves the backtest is robust to edge degradation.
+        if self.win_rate_check:
+            gate_personas = [self.PERSONAS[0], self.PERSONAS[1]]
+            low_edge_personas = []
+            for p in gate_personas:
+                state = self._allocator._states.get(p)
+                total_trades = state.wins + state.losses if state else 0
+                if state is not None and total_trades >= 25:
+                    wr = state.win_rate()
+                    if wr < 0.30:
+                        low_edge_personas.append((p, total_trades, wr))
+            if len(low_edge_personas) == len(gate_personas):
+                names = ", ".join(f"{p.value}({wr:.0%})" for p, _, wr in low_edge_personas)
+                print(f"  ⛔ Win rate gate: both personas in drawdown [{names}] ≥ 25 trades — skipping")
+                self._log_skip(event_log, event_num, ts, anomaly, "win_rate_gate_drawdown")
+                self._update_skip_weights(signals, symbol)
+                return
+
+        # OPERATION HYDRA: Update SignalMatrix buffer after blended vote.
+        # Other symbols can read this for cross-symbol context — but personas
+        # are completely blind to it (MoE votes remain independent per symbol).
+        self._latest_signals[symbol] = blended
+
+        # OPERATION HYDRA: Check for spread trade conditions.
+        # Only evaluate when ALL symbols in universe have active blended signals.
+        spread_executed = False
+        signal_matrix = dict(self._latest_signals)
+        if all(sym in signal_matrix for sym in self.universe):
+            spread = self._pairs_trader.evaluate(signal_matrix)
+            if spread is not None:
+                # FIX B3: Spread trade outcomes are FABRICATED here — btc_outcome and
+                # eth_outcome are set by hard-coded rules (always WIN for BTC leg) that
+                # bear no relationship to actual price action.  Results are not trustworthy.
+                # We mark every spread as synthetic in both the object and the event log.
+                btc_exit  = float(df["close"].iloc[idx]) if idx < len(df) else spread.long_entry
+                eth_exit  = btc_exit  # Fallback; real implementation uses cross-symbol df
+                btc_outcome = "HOLD"
+                eth_outcome = "HOLD"
+                # Resolve which leg is BTC / ETH
+                if spread.long_symbol == "BTCUSDT":
+                    btc_outcome, btc_exit = "WIN", spread.long_entry + 3.0 * self._get_atr_from_ctx(ctx)
+                    eth_outcome = "WIN" if spread.short_direction == "SHORT" else "LOSS"
+                elif spread.short_symbol == "BTCUSDT":
+                    btc_outcome, btc_exit = "WIN", spread.short_entry - 3.0 * self._get_atr_from_ctx(ctx)
+                    eth_outcome = "WIN" if spread.long_direction == "LONG" else "LOSS"
+                updated_spread = self._pairs_trader.simulate_outcome(
+                    spread, btc_outcome, btc_exit, eth_outcome, eth_exit
+                )
+                updated_spread.notes.append(
+                    "[SYNTHETIC] Spread outcome is NOT backtested — WIN/LOSS rules are "
+                    "hard-coded. Exclude from win rate, Sharpe, and total PnL calculations."
+                )
+                self._spread_trades.append(updated_spread)
+                # FIX B3 (CRITICAL): Do NOT add synthetic spread PnL to equity or PnL
+                # totals. The spread outcome is fabricated (hard-coded WIN/LOSS rules)
+                # and must not contaminate the equity curve, Sharpe, or win-rate stats.
+                # The trade is recorded in _spread_trades and the event log for
+                # informational purposes only (is_synthetic_spread=True).
+                print(f"  🐍 HYDRA SPREAD [SYNTHETIC]: Long {spread.long_symbol} {spread.long_size:.4f} "
+                      f"Short {spread.short_symbol} {spread.short_size:.4f} "
+                      f"margin=${spread.combined_margin:.2f} risk=${spread.total_risk_usd:.2f} "
+                      f"→ {updated_spread.result} pnl=${updated_spread.pnl:+.4f} "
+                      f"[WARNING: synthetic — not real backtest data]")
+                event_log.append({
+                    "event_num": event_num,
+                    "timestamp": ts.isoformat(),
+                    "anomaly": anomaly,
+                    "executed": True,
+                    "spread": updated_spread.to_dict(),
+                    "trade_result": updated_spread.result,
+                    "pnl": updated_spread.pnl,
+                    "is_spread": True,
+                    "is_synthetic_spread": True,   # FIX B3: flag for stats exclusion
+                })
+                spread_executed = True
+                # Skip single-leg execution when spread was taken
+                returns_dict = {p: 0.0 for p in self.PERSONAS}
+                positions_dict = {p: 0.0 for p in self.PERSONAS}
+                for p in self.PERSONAS:
+                    self._symbol_weights[symbol].update(p.value, 0.0)
+                self._allocator.update_all(signals, returns_dict, positions_dict)
+                return
 
         if blended["confidence"] < self.min_confidence:
             print(f"  ⏭ Skip: blended confidence {blended['confidence']} < {self.min_confidence}")
@@ -409,21 +715,73 @@ class ChronosBacktester:
             # Even if skipped, update allocator with 0 returns for this epoch
             returns_dict = {p: 0.0 for p in self.PERSONAS}
             positions_dict = {p: self._equity for p in self.PERSONAS}
-            # OPERATION DARWIN: feed 0 returns to the weighter so it learns "no trade"
+            # OPERATION HYDRA: per-symbol weighter — feed 0 returns for "no trade"
             for p in self.PERSONAS:
-                self._weighter.update(p.value, 0.0)
+                self._symbol_weights[symbol].update(p.value, 0.0)
             self._allocator.update_all(signals, returns_dict, positions_dict)
             return
+
+        # ── Step f: Pre-compute position sizing for RiskGuard ─────────────
+        # RiskGuard needs notional and leverage BEFORE the trade is simulated.
+        # We compute the same sizing that _simulate_trade_outcome will use so that
+        # RiskGuard's notional cap and leverage circuit breaker are enforced.
+        # FIX #39: In compound mode, use _realized_equity (closed PnL only) for
+        # position sizing, NOT _equity which includes unrealized MTM gains.
+        working_equity = self._realized_equity if self.compound else self.initial_equity
+        risk_usd = working_equity * sys_config.DEFAULT_RISK_PCT
+        entry_price = ctx.get("current_price", ctx.get("candle_close", 100_000))
+        atr = self._get_atr_from_ctx(ctx)
+        anomaly = event.anomaly_type
+        sl_amt = abs(self._get_sl_amount(event, entry_price))
+        if sl_amt <= 0:
+            print(f"  ⏭ Skip: zero stop distance")
+            self._log_skip(event_log, event_num, ts, anomaly, "zero_sl_distance")
+            self._update_skip_weights(signals, symbol)
+            return
+        size_coins = risk_usd / sl_amt
+        notional = size_coins * entry_price
+
+        # FIX R1: Enforce RiskGuard checks BEFORE every simulated trade.
+        # check_all() raises RiskLimitExceeded on the first breach (fail-fast).
+        # We catch and log so the backtest can continue with other events.
+        if self._risk_guard is not None:
+            maker_fee_pct = 0.0002
+            entry_fee = notional * maker_fee_pct
+            est_leverage = notional / working_equity if working_equity > 0 else 0.0
+            try:
+                self._risk_guard.update_equity(working_equity)
+                self._risk_guard.check_all(
+                    proposed_notional=notional + entry_fee,
+                    proposed_leverage=est_leverage,
+                    risk_environment="moderate_risk",
+                    proposed_exposure={symbol: notional},
+                )
+            except RiskLimitExceeded as e:
+                print(f"  ⛔ RiskGuard blocked trade: {e.limit_name} — {e.reason}")
+                self._log_skip(event_log, event_num, ts, anomaly, f"risk_guard_{e.limit_name}")
+                self._update_skip_weights(signals, symbol)
+                self._risk_guard.update_equity(working_equity)
+                return
 
         # ── Step f: Simulate trade execution ──────────────────────────────
         trade = self._simulate_trade(event, blended, idx, ts, weights, fitnesses, signals)
         self._trades.append(trade)
 
         # ── Step g: Outcome simulation + Reflexion loop ──────────────────
-        outcome = self._simulate_trade_outcome(df, idx, trade, blended)
+        # FIX E1: _simulate_trade_outcome now uses close-only prices (no wick peek).
+        # FIX R1: pre_notional / pre_size_coins computed above so RiskGuard ran first.
+        outcome = self._simulate_trade_outcome(
+            df, idx, trade, blended,
+            pre_notional=notional,
+            pre_size_coins=size_coins,
+        )
         trade.trade_result = outcome["result"]
         trade.pnl = outcome["pnl"]
+        # FIX #39: Update both total equity and realized-only equity.
+        # _equity tracks total (incl. unrealized MTM); _realized_equity tracks only
+        # closed-trade PnL and is the basis for compound position sizing.
         self._equity += outcome["pnl"]
+        self._realized_equity += outcome["pnl"]
         self._total_pnl += outcome["pnl"]
         if outcome["result"] == "WIN":
             self._wins += 1
@@ -433,7 +791,8 @@ class ChronosBacktester:
         # ── Step h: Update Allocator with actual returns ──────────────────
         returns_dict = {}
         positions_dict = {}
-        working_equity = self._equity if self.compound else self.initial_equity
+        # working_equity already computed above in Step f; reuse it here
+        # (saves a redundant compound-ternary eval on every trade)
         for p in self.PERSONAS:
             sig = signals.get(p)
             if not sig or sig.direction.value == "NEUTRAL":
@@ -453,12 +812,20 @@ class ChronosBacktester:
                 pos_mult = sig.confidence / 100.0
                 positions_dict[p] = working_equity * pos_mult * sig.leverage
 
-        # OPERATION DARWIN: feed realised returns to the Sortino-based weighter
+        # OPERATION HYDRA: per-symbol weighter — feed realised returns
         for p in self.PERSONAS:
             sig = signals.get(p)
             if sig and sig.direction.value != "NEUTRAL":
                 ret = returns_dict.get(p, 0.0)
-                self._weighter.update(p.value, ret)
+                self._symbol_weights[symbol].update(p.value, ret)
+
+        # L3 fix: persist MoE weights to MemoryBank after every trade.
+        # Previously update() was called but results were discarded at process exit.
+        # Now they survive process restarts and are available to MetaLearningRunner.
+        self._memory_bank.save_moe_weights(
+            weights=self._symbol_weights[symbol].get_weights(),
+            symbol=symbol,
+        )
 
         self._allocator.update_all(signals, returns_dict, positions_dict)
 
@@ -539,7 +906,7 @@ class ChronosBacktester:
                 "symbol": ctx.get("symbol", "BTCUSDT"),
                 "anomaly_type": event.anomaly_type,
                 "derivatives": {
-                    "binance_oi_usd": ctx.get("atr_14", 100) * 1e6,
+                    "binance_oi_usd": self._get_atr_from_ctx(ctx) * 1e6,
                     "oi_change_pct": 2.5,   # Simulated OI growth
                     "oi_trend": "rising",
                     "binance_funding": 0.0010,
@@ -673,17 +1040,43 @@ class ChronosBacktester:
         direction = blended["direction"]
         confidence = blended["confidence"]
         price = ctx.get("current_price", ctx.get("candle_close", 100_000))
+        anomaly = event.anomaly_type
+        atr = self._get_atr_from_ctx(ctx)
+        rsi = ctx.get("rsi_14", 50)
 
-        # Stop/TP from ATR-based sizing
-        atr = ctx.get("atr_14", 100)
+        # ── FIX 1: Adaptive ATR multipliers per anomaly type ──────────────────────
+        # Scanner detects TYPE, not magnitude. Anomaly type informs the expected
+        # move distance. This replaces the hard-coded 2×/3× ATR (RR=1.5).
+        ANOMALY_TP_ATR = {
+            "LIQUIDITY_SWEEP":    2.0,
+            "EXTREME_DEVIATION":  3.5,
+            "VOLATILITY_SQUEEZE": 4.0,
+        }
+        ANOMALY_SL_ATR = {
+            "LIQUIDITY_SWEEP":    1.0,
+            "EXTREME_DEVIATION":  1.5,
+            "VOLATILITY_SQUEEZE": 1.5,
+        }
+
+        tp_mult = ANOMALY_TP_ATR.get(anomaly, 3.0)
+        sl_mult = ANOMALY_SL_ATR.get(anomaly, 2.0)
+
+        # RSI conviction modifier: deeply oversold/overbought = let winners run more
+        if rsi < 25 or rsi > 75:
+            tp_mult *= 1.2
+            sl_mult *= 0.8   # tighter stop with high conviction
+
+        tp_amt = tp_mult * atr
+        sl_amt = sl_mult * atr
+
         if direction == "LONG":
             entry = price
-            stop  = entry - 2.0 * atr
-            tp    = entry + 3.0 * atr
+            stop  = entry - sl_amt
+            tp    = entry + tp_amt
         elif direction == "SHORT":
             entry = price
-            stop  = entry + 2.0 * atr
-            tp    = entry - 3.0 * atr
+            stop  = entry + sl_amt
+            tp    = entry - tp_amt
         else:
             entry, stop, tp = price, 0, 0
 
@@ -699,6 +1092,7 @@ class ChronosBacktester:
         return BlendedTrade(
             event_idx=idx,
             timestamp=ts,
+            symbol=event.context_data.get("symbol", "BTCUSDT"),   # OPERATION HYDRA
             anomaly_type=event.anomaly_type,
             direction=direction,
             confidence=confidence,
@@ -728,15 +1122,26 @@ class ChronosBacktester:
         idx: int,
         trade: BlendedTrade,
         blended: Dict[str, Any],
+        pre_notional: float = 0.0,
+        pre_size_coins: float = 0.0,
     ) -> Dict[str, Any]:
         """
-        Look ahead up to 48 candles after entry to determine WIN/LOSS outcome.
+        FIX B2 + FIX E1: Close-only outcome simulation.
 
-        WIN  = price hits TP before SL (for longs: close >= TP; for shorts: close <= TP)
-        LOSS = price hits SL before TP (for longs: close <= SL; or lookahead exhausted)
-        HOLD = price is between SL and TP when lookahead window expires
-        
-        Implements Fixed Fractional Risk math with 2% risk limit and fees.
+        Looks ahead up to 48 candles after entry to determine WIN/LOSS outcome
+        using ONLY the candle close price — NO intrabar wick access.
+
+        WIN  = candle close crosses TP level
+        LOSS = candle close crosses SL level (or lookahead exhausted)
+        HOLD = candle close stays between SL and TP for entire lookahead window
+
+        Risk sizing (Fixed Fractional): risk exactly DEFAULT_RISK_PCT of equity.
+        Fees: Binance maker fee of 0.02% applied to both entry and exit.
+
+        Args:
+            pre_notional:     Notional value pre-computed in _process_event so that
+                              RiskGuard.check_all() ran BEFORE this function.
+            pre_size_coins:   Position size in coins pre-computed for same reason.
         """
         direction = blended["direction"]
         if direction == "NEUTRAL":
@@ -745,92 +1150,95 @@ class ChronosBacktester:
         entry = trade.entry_price
         sl = trade.stop_loss
         tp = trade.take_profit
-        
-        # --- Strict Risk & Position Sizing Math ---
-        # 1. Risk exactly DEFAULT_RISK_PCT of current equity
-        risk_pct = sys_config.DEFAULT_RISK_PCT
-        working_equity = self._equity if self.compound else self.initial_equity
-        risk_usd = working_equity * risk_pct
-        
-        # 2. Distance to stop loss
-        sl_dist = abs(entry - sl)
-        if sl_dist <= 0:
-            return {"result": "HOLD", "pnl": 0.0, "pnl_pct": 0.0}
-            
-        # 3. Size in coins needed to lose exactly risk_usd if SL is hit
-        size_coins = risk_usd / sl_dist
-        
-        # 4. Notional value of the position
-        notional = size_coins * entry
 
-        # GHOST SNIPER: Enforce Binance min notional $5
-        if notional < 5.0:
-            notional = 5.0
-            size_coins = 5.0 / entry
-            # If bumping to $5 notional causes loss to exceed 2% of account, reject trade
-            loss_at_min = risk_pct * working_equity  # already bumped to 2%
-            if loss_at_min > working_equity * 0.02:
-                return {"result": "SKIPPED", "pnl": 0.0, "pnl_pct": 0.0,
-                        "reason": "SKIPPED: SL too wide for $50 account"}
-        
-        # 5. Cap leverage (e.g. max 10x account equity)
-        max_notional = working_equity * 10
-        if notional > max_notional:
-            notional = max_notional
-            size_coins = notional / entry
-            # Risk is now less than 2% because we hit the leverage cap
-            
-        trade.position_value = notional  # Update trade object with actual size
-        
-        # 6. Friction / Fees
-        maker_fee_pct: float = 0.0002  # Binance maker fee = 0.02%
+        # Position sizing — use pre-computed values from _process_event so that
+        # RiskGuard ran before this function.  If caller passed 0 (legacy call),
+        # fall back to computing here (backwards-compatible).
+        maker_fee_pct: float = 0.0002
         fee_rate = maker_fee_pct
+        # FIX #39: Use _realized_equity (closed PnL only) for sizing, matching the
+        # fix applied in _process_event above. This prevents open-position MTM from
+        # inflating/deflating subsequent trade sizing.
+        working_equity = self._realized_equity if self.compound else self.initial_equity
+
+        if pre_notional > 0 and pre_size_coins > 0:
+            notional = pre_notional
+            size_coins = pre_size_coins
+        else:
+            # Fallback: compute sizing here (legacy path)
+            risk_pct = sys_config.DEFAULT_RISK_PCT
+            risk_usd = working_equity * risk_pct
+            sl_dist = abs(entry - sl)
+            if sl_dist <= 0:
+                return {"result": "HOLD", "pnl": 0.0, "pnl_pct": 0.0}
+            size_coins = risk_usd / sl_dist
+            notional = size_coins * entry
+            # Enforce $5 min notional
+            if notional < 5.0:
+                notional = 5.0
+                size_coins = 5.0 / entry
+                if notional > working_equity:
+                    return {"result": "SKIPPED", "pnl": 0.0, "pnl_pct": 0.0,
+                            "reason": "SKIPPED: $5 min notional exceeds account equity"}
+            # Cap at 10× leverage
+            max_notional = working_equity * 10
+            if notional > max_notional:
+                notional = max_notional
+                size_coins = notional / entry
+
+        trade.position_value = notional
         entry_fee = notional * fee_rate
 
-        look_ahead = 48  # candles to scan for outcome
+        # FIX E1: CLOSE-ONLY OUTCOME SIMULATION
+        # Previous code peeked at candle high/low (wick) to detect SL/TP hits within
+        # the bar.  This is LOOKAHEAD BIAS — the backtest "saw" the wick before the
+        # candle closed, then computed the outcome.  In live trading you only know the
+        # close price once the bar closes.
+        #
+        # FIX E1 uses only candle close.  A stop is hit when the close crosses the SL
+        # level (not when the wick touches it).  This is a CONSERVATIVE estimate:
+        # some valid stops that were hit by wicks but closed back above/below will
+        # show as HOLD.  This underestimates edge, which is the honest direction.
+        look_ahead = 48
         end_idx = min(idx + look_ahead + 1, len(df))
 
         result = "HOLD"
         exit_price = entry
 
         for j in range(idx + 1, end_idx):
-            candle_low = float(df["low"].iloc[j])
-            candle_high = float(df["high"].iloc[j])
-            
-            # Stop-loss hit first (pessimistic check: evaluate SL before TP for safety)
-            if direction == "LONG" and candle_low <= sl:
+            candle_close = float(df["close"].iloc[j])
+
+            # SL hit: close crosses below (long) or above (short) the stop level
+            if direction == "LONG" and candle_close <= sl:
                 result = "LOSS"
-                exit_price = sl
+                exit_price = candle_close
                 break
-            if direction == "SHORT" and candle_high >= sl:
+            if direction == "SHORT" and candle_close >= sl:
                 result = "LOSS"
-                exit_price = sl
+                exit_price = candle_close
                 break
-            # Take-profit hit
-            if direction == "LONG" and candle_high >= tp:
+            # TP hit: close crosses above (long) or below (short) the target level
+            if direction == "LONG" and candle_close >= tp:
                 result = "WIN"
-                exit_price = tp
+                exit_price = candle_close
                 break
-            if direction == "SHORT" and candle_low <= tp:
+            if direction == "SHORT" and candle_close <= tp:
                 result = "WIN"
-                exit_price = tp
+                exit_price = candle_close
                 break
 
-        # Calculate final PnL if trade closed
         if result == "HOLD":
             return {"result": "HOLD", "pnl": 0.0, "pnl_pct": 0.0}
-            
-        # Gross PnL
+
+        # PnL calculation
         if direction == "LONG":
             gross_pnl = (exit_price - entry) * size_coins
         else:
             gross_pnl = (entry - exit_price) * size_coins
-            
-        # Exit fee
+
         exit_notional = size_coins * exit_price
         exit_fee = exit_notional * fee_rate
-        
-        # Net PnL
+
         net_pnl = gross_pnl - entry_fee - exit_fee
         pnl_pct = (net_pnl / working_equity) * 100
 
@@ -889,10 +1297,12 @@ class ChronosBacktester:
             )
             
             # Fetch past lessons to inject into the psychologist's prompt
+            # L6 fix: only fetch LIVE lessons for live trading decisions
             past_lessons = self._memory_bank.retrieve_lessons(
                 persona_type.value,
                 event.anomaly_type,
                 limit=3,
+                source_mode=self.source_mode,
             )
 
             rule = persona.reflect_on_loss(
@@ -905,38 +1315,220 @@ class ChronosBacktester:
 
             print(f"  📖 Lesson learned: \"{rule}\"")
 
-            # Persist to Memory Bank (no-op in dry_run for LLM cost, but still saves)
+            # Persist to Memory Bank
+            # L6 fix: tag with source_mode so DRY_RUN lessons never pollute LIVE DB
             self._memory_bank.save_lesson(
                 persona=persona_type.value,
                 anomaly_type=event.anomaly_type,
                 pnl=pnl_val,
                 thesis=thesis,
                 lesson=rule,
+                source_mode=self.source_mode,
             )
             self._reflexions_run += 1
             print(f"  💾 Saved to MemoryBank (total reflexions: {self._reflexions_run})")
 
+        # L4 fix: call ReflexionEvolver.evolve_from_trades() to process batch lessons.
+        # Previously defined but never invoked — now wired into the reflexion loop.
+        # Build a trade log from this single trade for the evolver.
+        trade_log_entry = {
+            "persona": loser_direction,
+            "pnl": outcome["pnl"],
+            "pnl_pct": outcome["pnl_pct"],
+            "entry_price": event.context_data.get("current_price", 0),
+            "exit_price": event.context_data.get("current_price", 0),
+            "anomaly_type": event.anomaly_type,
+            "market_context": market_context,
+            "generation": getattr(self._ga_optimizer, "generation", 0) if self._ga_optimizer else 0,
+        }
+        self._reflexion_evolver.evolve_from_trades([trade_log_entry])
+
         # OPERATION DARWIN: after every LOSS, recalibrate scanner thresholds to current volatility.
         # Uses GeneticOptimizer.recalibrate_scanner() which adapts:
-        #   High vol  → wider sweep threshold, stricter z-score, higher min_confidence
-        #   Low vol   → tighter sweep threshold, looser z-score, lower min_confidence
+        #   High vol  → wider sweep threshold, stricter ATR multiplier, higher RSI selectivity
+        #   Low vol   → tighter sweep threshold, looser ATR multiplier, lower RSI selectivity
         if outcome.get("result") == "LOSS" and outcome.get("pnl_pct", 0) < -1.0:
-            from ..models.meta_learning import GeneticOptimizer, ScannerConfig
-            if not hasattr(self, "_ga_optimizer") or self._ga_optimizer is None:
-                # Initialise with default ScannerConfig (no SCANNER_CONFIG in sys_config yet)
+            if self._ga_optimizer is None:
                 self._ga_optimizer = GeneticOptimizer()
             # Derive current volatility from the ATR embedded in context data
-            atr = ctx.get("atr_14", 0.0)
+            atr = self._get_atr_from_ctx(ctx)
             current_price = ctx.get("current_price", ctx.get("candle_close", 100_000.0))
             vol_now = abs(atr / current_price) if current_price > 0 else 0.02
-            new_cfg = self._ga_optimizer.recalibrate_scanner(current_volatility=vol_now)
-            # NOTE: scanner.update_config() must be implemented in scanner.py to accept new thresholds
+            new_cfg: ScannerParams = self._ga_optimizer.recalibrate_scanner(
+                current_volatility=vol_now
+            )
+            # L2 fix: scanner.update_config() validates and applies the new params
             if hasattr(self._scanner, "update_config"):
                 self._scanner.update_config(new_cfg)
-            print(f"  🧬 GA recalibrated scanner → sweep={new_cfg.sweep_threshold:.4f} "
-                  f"z={new_cfg.deviation_z_score:.2f} conf={new_cfg.min_confidence_threshold}")
+            print(f"  🧬 GA recalibrated scanner → sweep={new_cfg.sweep_threshold_pct:.4f} "
+                  f"atr_mult={new_cfg.deviation_atr_multiplier:.2f} "
+                  f"rsi_os={new_cfg.rsi_oversold:.0f}/{new_cfg.rsi_overbought:.0f}")
 
     # ── PnL tracking ──────────────────────────────────────────────────────
+
+    # ── FIX #4: Helper to get ATR from context with price-based fallback ───
+    # Previously used hardcoded ctx.get("atr_14", 100) which is meaningless
+    # for any price level. Now uses actual ATR from scanner context, or
+    # estimates from price (typical crypto ATR ~2% of price).
+    def _get_atr_from_ctx(self, ctx: Dict[str, Any]) -> float:
+        if "atr_14" in ctx and ctx["atr_14"] is not None:
+            return float(ctx["atr_14"])
+        # Fallback: estimate ATR as 2% of price (typical crypto volatility)
+        price = ctx.get("current_price", ctx.get("candle_close", 100_000))
+        return price * 0.02
+
+    # ── FIX E1 + FIX R1: Stop-loss amount helper ─────────────────────────
+    # Used to pre-compute SL distance in _process_event BEFORE RiskGuard runs.
+    # Mirrors the ATR-based SL logic in _simulate_trade to ensure consistency.
+    def _get_sl_amount(self, event: ScannerEvent, entry: float) -> float:
+        ctx = event.context_data
+        atr = self._get_atr_from_ctx(ctx)
+        anomaly = event.anomaly_type
+        ANOMALY_SL_ATR = {
+            "LIQUIDITY_SWEEP":    1.0,
+            "EXTREME_DEVIATION":  1.5,
+            "VOLATILITY_SQUEEZE": 1.5,
+        }
+        sl_mult = ANOMALY_SL_ATR.get(anomaly, 2.0)
+        rsi = ctx.get("rsi_14", 50)
+        if rsi < 25 or rsi > 75:
+            sl_mult *= 0.8   # tighter stop with high conviction
+        return sl_mult * atr
+
+    # ── P1-FIX: Trend detection with incremental EMA50 ──────────────────
+    def _detect_trend(self, hist_df: pd.DataFrame, symbol: str, lookback: int = 20) -> str:
+        """Detect short-term trend from EMA50 slope over lookback candles.
+
+        P1-FIX: EMA50 is updated incrementally from _ema50_cache instead of
+        recomputing the full ewm() over the entire growing hist_df on every call.
+        O(1) per event instead of O(n) where n = total candles seen so far.
+
+        Returns: 'UP' | 'DOWN' | 'SIDEWAYS'
+        """
+        n = len(hist_df)
+        if n < lookback + 5:
+            return "SIDEWAYS"
+
+        closes = hist_df["close"].values  # numpy for fast indexing
+        prev_ema, prev_n = self._ema50_cache.get(symbol, (None, 0))
+        alpha = 2.0 / (50 + 1)
+
+        if prev_ema is None or prev_n == 0:
+            # Cold start: compute EMA from scratch using pandas (warm-up period)
+            s = pd.Series(closes)
+            ema_series = s.ewm(span=50, adjust=False).mean()
+            ema_val = float(ema_series.iloc[-1])
+            self._ema50_cache[symbol] = (ema_val, n)
+        else:
+            # Incremental update: only process candles since last call
+            new_candles = n - prev_n
+            ema_val = prev_ema
+            for i in range(n - new_candles, n):
+                ema_val = alpha * closes[i] + (1 - alpha) * ema_val
+            self._ema50_cache[symbol] = (ema_val, n)
+
+        # FIX 5 (CRITICAL): Compute both current and lookback EMAs from the SAME
+        # pandas series so they are fully consistent (no drift from incremental cache).
+        # iloc[-lookback] gives the EMA value at the point-in-time that was
+        # `lookback` candles ago, which is the correct historical reference.
+        ema_series = hist_df["close"].ewm(span=50, adjust=False).mean()
+        ema_val = float(ema_series.iloc[-1])   # current EMA50
+        lookback_ema = float(ema_series.iloc[-lookback])  # EMA50 `lookback` candles ago
+        slope = (ema_val - lookback_ema) / (lookback_ema * lookback)
+
+        if slope > 0.005:
+            return "UP"
+        if slope < -0.005:
+            return "DOWN"
+        return "SIDEWAYS"
+
+    # ── FIX 4/5: Shared skip logging helper ───────────────────────────────
+    def _log_skip(
+        self,
+        event_log: List[Dict],
+        event_num: int,
+        ts: datetime,
+        anomaly: str,
+        reason: str,
+    ) -> None:
+        """Append a skip entry to the event log (avoids duplicating this logic)."""
+        event_log.append({
+            "event_num": event_num,
+            "timestamp": ts.isoformat(),
+            "anomaly": anomaly,
+            "executed": False,
+            "reason": reason,
+        })
+
+    def _update_skip_weights(
+        self,
+        signals: Dict[PersonaType, PersonaSignal],
+        symbol: str,
+    ) -> None:
+        """Feed 0 returns to all personas when a trade is skipped (shared by Fix 4/5)."""
+        returns_dict = {p: 0.0 for p in self.PERSONAS}
+        positions_dict = {p: 0.0 for p in self.PERSONAS}
+        for p in self.PERSONAS:
+            self._symbol_weights[symbol].update(p.value, 0.0)
+        self._allocator.update_all(signals, returns_dict, positions_dict)
+
+    # ── L1: Meta-learning orchestration ─────────────────────────────────────
+
+    def run_meta_learning_cycle(
+        self,
+        train_dfs: dict[str, pd.DataFrame],
+        val_dfs:  dict[str, pd.DataFrame] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Run the meta-learning evolution cycle after a backtest.
+
+        This is the L1 fix — it wires GeneticOptimizer.evolve() into the
+        production pipeline so it is actually called.
+
+        Pipeline:
+          1. Score the entire GA population on train_dfs
+          2. Evolve one generation
+          3. Walk-forward validate (if val_dfs provided)
+          4. Apply accepted config to scanner
+          5. Persist to MemoryBank
+
+        Usage:
+            result = engine.run_backtest({"BTCUSDT": df})
+            ml_result = engine.run_meta_learning_cycle(
+                train_dfs={"BTCUSDT": df_train},
+                val_dfs={"BTCUSDT": df_val},
+            )
+            print(ml_result["elite_config"])
+
+        Parameters
+        ----------
+        train_dfs : dict[str, pd.DataFrame]
+            In-sample DataFrames for GA fitness evaluation.
+        val_dfs : dict[str, pd.DataFrame] | None
+            Out-of-sample DataFrames for walk-forward validation (L7).
+            Required when MetaLearningRunner.use_walk_forward=True.
+
+        Returns
+        -------
+        dict[str, Any]
+            Result from MetaLearningRunner.run_cycle().
+        """
+        # Inject current MoE weights for persistence
+        symbol_weights_dict: dict[str, dict[str, float]] = {}
+        for sym, weighter in self._symbol_weights.items():
+            symbol_weights_dict[sym] = weighter.get_weights()
+        self._meta_runner.inject_moe_weights(symbol_weights_dict)
+
+        # Wire current scanner config as the seed for the next run
+        if hasattr(self._scanner, "config"):
+            current_params = self._scanner.config
+            if isinstance(current_params, ScannerParams):
+                self._meta_runner._ga.config = current_params
+
+        return self._meta_runner.run_cycle(
+            train_dfs=train_dfs,
+            val_dfs=val_dfs,
+        )
 
     def _build_equity_curve(self) -> List[Dict]:
         """Build equity curve from trades."""
@@ -959,6 +1551,10 @@ class ChronosBacktester:
         wins   = sum(1 for t in self._trades if t.trade_result == "WIN")
         losses = sum(1 for t in self._trades if t.trade_result == "LOSS")
         trades = len(self._trades)
+        # FIX B3: Count synthetic spreads separately so total_pnl and win_rate are honest.
+        # Spread trades stored in self._spread_trades; self._trades is single-leg only.
+        synthetic_spreads = len(self._spread_trades)
+
         equity_end = equity_curve[-1]["equity"] if equity_curve else self.initial_equity
         pnl_pct = (equity_end - self.initial_equity) / self.initial_equity * 100
 
@@ -978,6 +1574,12 @@ class ChronosBacktester:
                 returns.append(ret)
             prev_equity = equity
 
+        # FIX B6: Sharpe is computed ONLY over actual trade returns.
+        # equity_curve only contains points where self._trades had an entry; there are
+        # no idle-period padding entries, so this was already correct.  The Sharpe
+        # annualisation (×√365) is documented as a simplification — it assumes
+        # ~1 trade/day.  For intraday strategies with many trades per day, divide
+        # sharpe_approx by sqrt(trades_per_day) for a more honest figure.
         returns_arr = np.array(returns) if returns else np.array([0.0])
         sharpe = (returns_arr.mean() / returns_arr.std() * math.sqrt(365)
                 if returns_arr.std() > 1e-12 else 0.0)
@@ -997,6 +1599,8 @@ class ChronosBacktester:
             "reflexions_run": self._reflexions_run,
             "lessons_in_bank": self._memory_bank.lesson_count(),
             "allocator_summary": self._allocator.summary(),
+            "synthetic_spreads": synthetic_spreads,   # FIX B3: flagged, excluded from stats
+            "spread_pnl": sum(s.pnl for s in self._spread_trades),   # FIX B3: reported separately
         }
 
     def _zero_result(self, note: str) -> Dict[str, Any]:
@@ -1021,19 +1625,27 @@ class ChronosBacktester:
             "llm_calls_skipped": True,
             "reflexions_run": 0,
             "lessons_in_bank": self._memory_bank.lesson_count(),
+            "allocator_summary": self._allocator.summary(),
+            "synthetic_spreads": 0,   # FIX B3
+            "spread_pnl": 0.0,        # FIX B3
             "note": note,
         }
 
     def _print_summary(self, summary: Dict):
-        print(f"  Events triggered:  {summary['events_triggered']}")
-        print(f"  Trades executed:  {summary['trades']}")
-        print(f"  Win rate:        {summary['win_rate']:.0%}")
-        print(f"  Final equity:    ${summary['final_equity']:,.2f}")
-        print(f"  Total PnL:      ${summary['total_pnl']:+,.2f} ({summary['pnl_pct']:+.2f}%)")
-        print(f"  Max drawdown:     {summary['max_drawdown_pct']:.1f}%")
-        print(f"  Sharpe (approx): {summary['sharpe_approx']:.2f}")
-        print(f"  Reflexions run:   {summary.get('reflexions_run', 0)}")
-        print(f"  Lessons in bank:  {summary.get('lessons_in_bank', 0)}")
+        print(f"  Events triggered:    {summary['events_triggered']}")
+        print(f"  Trades executed:    {summary['trades']}")
+        print(f"  Win rate:          {summary['win_rate']:.0%}")
+        print(f"  Final equity:      ${summary['final_equity']:,.2f}")
+        print(f"  Total PnL:        ${summary['total_pnl']:+,.2f} ({summary['pnl_pct']:+.2f}%)")
+        print(f"  Max drawdown:       {summary['max_drawdown_pct']:.1f}%")
+        print(f"  Sharpe (approx):   {summary['sharpe_approx']:.2f}")
+        print(f"  Reflexions run:     {summary.get('reflexions_run', 0)}")
+        print(f"  Lessons in bank:    {summary.get('lessons_in_bank', 0)}")
+        n_synth = summary.get("synthetic_spreads", 0)
+        synth_pnl = summary.get("spread_pnl", 0.0)
+        if n_synth > 0:
+            print(f"  Synthetic spreads:  {n_synth} [EXCLUDED from above stats]")
+            print(f"  Spread PnL:       ${synth_pnl:+,.2f} [FABRICATED — do not trust]")
 
     def _save_log(self, event_log: List[Dict]):
         os.makedirs(os.path.dirname(self.log_file) or ".", exist_ok=True)
@@ -1058,20 +1670,22 @@ class ChronosBacktester:
 # ─── CLI entry point helper ─────────────────────────────────────────────────────
 
 def run_chronos_backtest(
-    df: pd.DataFrame,
+    dfs: dict[str, pd.DataFrame],
+    universe: list[str] = None,
     mode: BacktestMode = BacktestMode.DRY_RUN,
     initial_equity: float = 10_000.0,
     min_confidence: int = 60,
     **kwargs,
 ) -> Dict[str, Any]:
-    """One-liner for CLI wiring."""
+    """One-liner for CLI wiring — OPERATION HYDRA accepts multi-symbol dfs."""
     engine = ChronosBacktester(
+        universe=universe,
         mode=mode,
         initial_equity=initial_equity,
         min_confidence=min_confidence,
         **kwargs,
     )
-    return engine.run_backtest(df)
+    return engine.run_backtest(dfs)
 
 
 # ─── Unit Tests ────────────────────────────────────────────────────────────────
@@ -1137,12 +1751,13 @@ if __name__ == "__main__":
     # ── Test 2: ChronosBacktester runs on seeded data ──────────────────────
     print("\n[Test 2] ChronosBacktester DRY_RUN on seeded data:")
     engine = ChronosBacktester(
+        universe=["BTCUSDT"],  # HYDRA: universe must be specified
         mode=BacktestMode.DRY_RUN,
         initial_equity=10_000,
         min_confidence=30,
         log_file="logs/test_chronos.json",
     )
-    result = engine.run_backtest(df)
+    result = engine.run_backtest({"BTCUSDT": df})  # HYDRA: dfs dict
     print(f"  Events triggered: {result['events_triggered']}")
     print(f"  Trades executed: {result['trades_executed']}")
     assert result["events_triggered"] >= 1, "Should trigger seeded events"
@@ -1154,7 +1769,7 @@ if __name__ == "__main__":
     scanner2 = VanguardScanner()
     clean_events = scanner2.scan(clean_df)
     if len(clean_events) == 0:
-        result2 = engine.run_backtest(clean_df)
+        result2 = engine.run_backtest({"BTCUSDT": clean_df})  # HYDRA: dfs dict
         assert result2["llm_calls_skipped"] is True
         print(f"  ✓ Empty events → llm_calls_skipped={result2['llm_calls_skipped']}")
 

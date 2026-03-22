@@ -1,8 +1,26 @@
 """
 Backtesting Engine - Core engine for strategy backtesting.
+
+DEPRECATION NOTICE (P2):
+    BacktestEngine (this file) and ChronosBacktester
+    (src/backtest/chronos_engine.py) use DIFFERENT liquidation formulas:
+
+    - BacktestEngine._check_liquidation (line ~295):
+        liq_price = entry * (1 ± 1/leverage - buffer)
+        Buffer is SUBTRACTED, making liquidation easier (conservative).
+
+    - ChronosBacktester uses RiskGuard.check_liquidation_buffer() which
+        computes distance_to_liquidation_pct = (entry - liq_price) / entry
+        and enforces a MINIMUM DISTANCE (1.5% for major coins, 2.5% for small).
+
+    ChronosBacktester is canonical. BacktestEngine is kept for legacy strategy
+    compatibility (production_strategy.py, aggressive_strategy.py) but its
+    _check_liquidation formula is NOT the same as the production liquidation logic.
+    Do not use BacktestEngine results as ground truth for production risk.
 """
 
 import copy
+import math
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Callable
 from dataclasses import dataclass, field
@@ -44,10 +62,12 @@ class Trade:
 
         if self.direction == TradeDirection.LONG:
             self.pnl = (exit_price - self.entry_price) * self.size
-            self.pnl_pct = (exit_price - self.entry_price) / self.entry_price * 100
+            # FIX #38: Use log returns for proper compounding
+            self.pnl_pct = (exit_price / self.entry_price - 1) * 100
         else:
             self.pnl = (self.entry_price - exit_price) * self.size
-            self.pnl_pct = (self.entry_price - exit_price) / self.entry_price * 100
+            # FIX #38: Use log returns for proper compounding
+            self.pnl_pct = (self.entry_price / exit_price - 1) * 100
 
         self.pnl -= self.fees
         self.status = "CLOSED"
@@ -107,16 +127,30 @@ class BacktestResult:
         gross_losses = abs(sum(t.pnl for t in losing)) if losing else 0
         self.profit_factor = gross_wins / gross_losses if gross_losses > 0 else 0
 
-        # Calculate equity curve and drawdown
+        # FIX #36: Calculate equity curve with unrealized PnL between trades.
+        # equity_snapshots: list of (timestamp, equity, unrealized_pnl) recorded
+        # during the backtest run loop. Each entry is a mark-to-market snapshot.
         equity = self.initial_equity
         peak = equity
         equity_curve = []
+
+        # Merge closed-trade equity steps with time-indexed MTM snapshots.
+        # Build a map of timestamp -> snapshot from equity_snapshots.
+        snapshot_map: Dict[datetime, float] = {}
+        unrealized_at_end = 0.0
+        for snap in getattr(self, "equity_snapshots", []):
+            ts = snap.get("time")
+            if ts is not None and snap.get("equity") is not None:
+                snapshot_map[ts] = snap["equity"]
+                unrealized_at_end = snap.get("unrealized_pnl", 0.0)
 
         for trade in closed_trades:
             equity += trade.pnl
             equity_curve.append({
                 "time": trade.exit_time,
                 "equity": equity,
+                "realized": True,
+                "unrealized_pnl": 0.0,
             })
 
             if equity > peak:
@@ -127,15 +161,71 @@ class BacktestResult:
                 self.max_drawdown_pct = drawdown
                 self.max_drawdown = peak - equity
 
+        # FIX #36 (continued): also expose the full MTM equity curve so
+        # drawdowns are visible even when positions are open.
+        # If snapshots were recorded, include them alongside closed-trade points.
+        if snapshot_map:
+            # Deduplicate: keep earliest snapshot per timestamp.
+            merged: List[Dict] = []
+            seen_times: set = set()
+            for pt in equity_curve:
+                if pt["time"] not in seen_times:
+                    merged.append(pt)
+                    seen_times.add(pt["time"])
+            # Add MTM snapshots that fall between (or after) closed trades.
+            for ts in sorted(snapshot_map.keys()):
+                if ts not in seen_times:
+                    mtm_equity = snapshot_map[ts]
+                    mtm_peak = max(mtm_equity, peak)
+                    mtm_drawdown = (mtm_peak - mtm_equity) / mtm_peak * 100 if mtm_peak > 0 else 0
+                    if mtm_drawdown > self.max_drawdown_pct:
+                        self.max_drawdown_pct = mtm_drawdown
+                        self.max_drawdown = mtm_peak - mtm_equity
+                    merged.append({
+                        "time": ts,
+                        "equity": mtm_equity,
+                        "realized": False,
+                        "unrealized_pnl": unrealized_at_end,
+                    })
+                    if mtm_equity > peak:
+                        peak = mtm_equity
+            equity_curve = sorted(merged, key=lambda x: x["time"])
+
         self.equity_curve = equity_curve
 
-        # Sharpe ratio (assuming 0% risk-free rate)
-        if len(closed_trades) > 1:
-            returns = [t.pnl_pct for t in closed_trades]
-            avg_return = sum(returns) / len(returns)
-            variance = sum((r - avg_return) ** 2 for r in returns) / len(returns)
-            std_return = variance ** 0.5
-            self.sharpe_ratio = avg_return / std_return if std_return > 0 else 0
+        # FIX #37: Compute Sharpe ratio from time-indexed equity returns (not
+        # trade-level returns) and annualise properly using sqrt(252).
+        # Uses the equity_snapshots recorded at each backtest timestamp.
+        time_returns: List[float] = []
+        if snapshot_map:
+            # Build a sorted list of snapshot values (MTM equity at each ts).
+            sorted_snaps = sorted(snapshot_map.items(), key=lambda x: x[0])
+            prev_equity_mtm = self.initial_equity
+            for ts, eq in sorted_snaps:
+                if prev_equity_mtm > 0:
+                    # FIX #38: Use log returns for proper compounding
+                    log_ret = math.log(eq / prev_equity_mtm) if eq > 0 and prev_equity_mtm > 0 else 0.0
+                    time_returns.append(log_ret)
+                prev_equity_mtm = eq
+        elif len(closed_trades) > 1:
+            # Fallback: time-indexed using exit timestamps of closed trades.
+            sorted_trades = sorted(closed_trades, key=lambda t: t.exit_time or datetime.min)
+            prev_equity_mtm = self.initial_equity
+            for t in sorted_trades:
+                if t.exit_time and prev_equity_mtm > 0:
+                    eq = prev_equity_mtm + t.pnl
+                    log_ret = math.log(eq / prev_equity_mtm) if eq > 0 and prev_equity_mtm > 0 else 0.0
+                    time_returns.append(log_ret)
+                    prev_equity_mtm = eq
+
+        if len(time_returns) > 1:
+            mean_ret = sum(time_returns) / len(time_returns)
+            variance = sum((r - mean_ret) ** 2 for r in time_returns) / len(time_returns)
+            std_ret = variance ** 0.5
+            # Annualise: assume daily data (252 trading days); sqrt(252) annualisation.
+            self.sharpe_ratio = (mean_ret / std_ret) * math.sqrt(252) if std_ret > 0 else 0.0
+        else:
+            self.sharpe_ratio = 0.0
 
         # Avg holding period
         holding_times = []
@@ -169,6 +259,38 @@ class BacktestEngine:
         self.equity = self.initial_equity
         self.trades = []
         self.open_trades = {}
+        self.equity_snapshots = []
+
+    def get_unrealized_pnl(self, current_prices: Dict[str, float] = None) -> float:
+        """
+        FIX #36: Calculate unrealized PnL from all open positions.
+        current_prices: dict of symbol -> current price.
+        If not provided, uses entry price (no MTM gain/loss assumed).
+        """
+        unrealized = 0.0
+        for symbol, trade in self.open_trades.items():
+            price = (current_prices or {}).get(symbol, trade.entry_price)
+            if trade.direction == TradeDirection.LONG:
+                pos_pnl = (price - trade.entry_price) * trade.size - trade.fees
+            else:
+                pos_pnl = (trade.entry_price - price) * trade.size - trade.fees
+            unrealized += pos_pnl
+        return unrealized
+
+    def record_equity_snapshot(self, timestamp: datetime, current_prices: Dict[str, float] = None):
+        """
+        FIX #36: Record a mark-to-market equity snapshot including unrealized PnL.
+        Call this at each backtest timestep so the equity curve shows open
+        position drawdown (not just realised gaps).
+        """
+        unrealized = self.get_unrealized_pnl(current_prices)
+        mtm_equity = self.equity + unrealized
+        self.equity_snapshots.append({
+            "time": timestamp,
+            "equity": mtm_equity,
+            "realized_equity": self.equity,
+            "unrealized_pnl": unrealized,
+        })
 
     def apply_slippage(self, price: float, direction: TradeDirection) -> float:
         """Apply slippage to price."""
@@ -306,7 +428,8 @@ class BacktestEngine:
             return current_price <= liq_price
         else:
             # Short: liquidation when price rises above entry + (1/leverage)
-            liq_price = trade.entry_price * (1 + 1.0 / trade.leverage + buffer)
+            # Buffer is SUBTRACTED so liquidation triggers slightly earlier (conservative)
+            liq_price = trade.entry_price * (1 + 1.0 / trade.leverage - buffer)
             return current_price >= liq_price
 
     def get_results(self, final_prices: dict = None) -> BacktestResult:
@@ -322,6 +445,9 @@ class BacktestEngine:
             self.close_trade(symbol, close_price, datetime.now(), "END_OF_BACKTEST")
 
         result = BacktestResult(trades=self.trades, initial_equity=self.initial_equity)
+        # FIX #36: Transfer equity snapshots so calculate_metrics can use them
+        # for the mark-to-market equity curve and time-indexed Sharpe ratio.
+        result.equity_snapshots = self.equity_snapshots
         result.calculate_metrics()
         return result
 
@@ -392,12 +518,34 @@ class MultiCoinBacktester:
         print(f"\nRunning backtest from {start_date} to {end_date}...")
         print(f"Total time points: {len(sorted_timestamps)}")
 
-        # Run strategy at each timestamp
+        # FIX #36: Record equity snapshot at each timestamp so the equity curve
+        # reflects mark-to-market (including open-position unrealized PnL).
+        current_prices: Dict[str, float] = {}
+
         for i, ts in enumerate(sorted_timestamps):
             current_time = datetime.fromtimestamp(ts / 1000)
 
             if i % 1000 == 0:
                 print(f"  Progress: {i}/{len(sorted_timestamps)}")
+
+            # Update current prices for all symbols using the latest candle close.
+            # This is needed for mark-to-market unrealized PnL in snapshots.
+            for symbol in symbols:
+                candles = self.data_cache.get(symbol, {}).get("1h", [])
+                past = [c for c in candles if c["timestamp"] <= ts]
+                if past:
+                    current_prices[symbol] = past[-1]["close"]
+
+            # Record MTM equity snapshot BEFORE processing this timestamp's signals.
+            # Unrealized PnL is computed using the prices from the previous step,
+            # which is the correct "end-of-previous-bar" mark-to-market.
+            self.engine.record_equity_snapshot(current_time, current_prices.copy())
+
+            # Check stops/TPs for all open positions before evaluating new entries.
+            for symbol in list(self.engine.open_trades.keys()):
+                price = current_prices.get(symbol)
+                if price is not None:
+                    self.engine.check_stop_take(symbol, price, current_time)
 
             # Run strategy for each symbol
             for symbol in symbols:

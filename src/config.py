@@ -56,7 +56,9 @@ POSITION_CAP_TRAINING = 1.0
 POSITION_CAP_ADVANCED = 1.5
 
 # Gate A: Small stop penalty threshold
-SMALL_STOP_THRESHOLD = 0.007  # 0.7%
+# Unified to 0.5% per CLAUDE.md (authoritative source)
+# This is the authoritative value — all code must use this.
+SMALL_STOP_THRESHOLD = 0.005  # 0.5%
 
 # Volume profile settings
 VOLUME_PROFILE_BINS = 50

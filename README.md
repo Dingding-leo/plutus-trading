@@ -12,179 +12,149 @@ A systematic cryptocurrency trading platform built in Python. From pure rule-bas
 | V2 | Hybrid Rule + LLM | LLM Macro Risk Officer execution gate, volatility shield |
 | V3 | MoE Trading Floor | Chronos Engine, VanguardScanner, 3 LLM personas, DynamicAllocator |
 | V3.1 | Reflexion Memory Matrix | SQLite RAG, post-mortem reflexion, self-healing personas |
+| V4 | Operation BLACK SWAN PREP | Risk infrastructure, KillSwitch, RiskGuard, Docker, TimescaleDB |
+| V4.1 | OMNIPOTENCE | Active Command Console, forensics dashboard, wired live pipeline |
+| V4.2 | Complete System Audit | Full 10-agent architecture review, execution wiring, fixes |
 
 ---
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        CLI (src/cli.py)                         │
-│              analyze | scan | trade | backtest                   │
-│              V1/V2/V3 modes — fully backward compatible         │
-└────────────────────────┬─────────────────────────────────────────┘
-                         │
-          ┌──────────────┴──────────────┐
-          ▼                              ▼
-┌──────────────────────────┐  ┌────────────────────────────────┐
-│   PLUTUS V1/V2 LAYER     │  │    PLUTUS V3 CHRONOS ENGINE    │
-│                          │  │                                │
-│  indicators.py           │  │  ┌──────────────────────────┐  │
-│  volume_profile.py       │  │  │ VanguardScanner (Layer 1) │  │
-│  market_context.py       │  │  │  Vectorised numpy/pandas  │  │
-│  workflow_analyzer.py     │  │  │  3 anomaly triggers:     │  │
-│  decision_engine.py      │  │  │  - LIQUIDITY_SWEEP       │  │
-│  position_sizer.py       │  │  │  - EXTREME_DEVIATION     │  │
-│  llm_client.py           │  │  │  - VOLATILITY_SQUEEZE    │  │
-│  (Macro Risk Officer)    │  │  └──────────┬───────────────┘  │
-│  hybrid_strategy.py       │  │             │ "wake" only on anomaly
-│  (Execution Gate)         │  │             ▼                   │
-└──────────────────────────┘  │  ┌──────────────────────────┐  │
-                              │  │ 3 LLM Personas (Layer 2) │  │
-                              │  │  - SMC_ICT               │  │
-                              │  │  - ORDER_FLOW            │  │
-                              │  │  - MACRO_ONCHAIN         │  │
-                              │  │  + RAG lesson injection  │  │
-                              │  │  + reflexion on loss     │  │
-                              │  └──────────┬───────────────┘  │
-                              │             │                    │
-                              │             ▼                    │
-                              │  ┌──────────────────────────┐  │
-                              │  │ DynamicAllocator (Layer 3)│  │
-                              │  │ Softmax over fitness:    │  │
-                              │  │ (Sortino*WinRate) /      │  │
-                              │  │ (1+Turnover*Penalty)     │  │
-                              │  └──────────┬───────────────┘  │
-                              │             │                    │
-                              │             ▼                    │
-                              │  ┌──────────────────────────┐  │
-                              │  │ MemoryBank (V3.1)        │  │
-                              │  │ SQLite RAG — lessons     │  │
-                              │  │ persisted at ~/.plutus/  │  │
-                              │  └──────────────────────────┘  │
-                              └────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           PLUTUS V4 — WIRES PIPELINE                            │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────────┐      │
+│  │                    LIVE TRADING PATH (wired in V4.1)                │      │
+│  │                                                              │      │
+│  │  BINANCE WEBSOCKET                                             │      │
+│  │       ↓                                                        │      │
+│  │  BinanceConnector._on_message() → XADD → Redis Stream            │      │
+│  │       ↓                                                        │      │
+│  │  IdempotentScannerWorker (asyncio.create_task in plutus_engine)     │      │
+│  │       ↓ Anomaly detected                                         │      │
+│  │       ↓ PUBLISH → Redis Pub/Sub                                  │      │
+│  │       ↓                                                        │      │
+│  │  LiveExecutionNode._on_anomaly()                                  │      │
+│  │       ↓                                                        │      │
+│  │  HybridWorkflowStrategy.analyze_symbol()                         │      │
+│  │  DecisionEngine.check_execution_gate()  ← 3-phase framework        │      │
+│  │  RiskGuard.check_all()  ← 9 sequential safety checks             │      │
+│  │       ↓                                                        │      │
+│  │  SmartRouter.route()  ← TWAP / VWAP / LimitQueue / Market        │      │
+│  │       ↓                                                        │      │
+│  │  BinanceExecutor.place_order()  ← real Binance Futures API         │      │
+│  │       ↓                                                        │      │
+│  │  RiskGuard.update_position_from_fill()                            │      │
+│  │       ↓                                                        │      │
+│  │  TimescaleDB write (OHLCV, fills, portfolio snapshots)           │      │
+│  │       ↓                                                        │      │
+│  │  Feedback → MetaLearning → MemoryBank (lesson learned)           │      │
+│  └──────────────────────────────────────────────────────────────────┘      │
+│                                                                          │
+│  ┌──────────────────────────────────────────────────────────────────────┐      │
+│  │                    BACKTEST PATH (ChronosEngine)                    │      │
+│  │                                                              │      │
+│  │  VanguardScanner.scan(df)  ← vectorised NumPy/Pandas             │      │
+│  │       ↓ wakes only on anomaly (99%+ of candles filtered)          │      │
+│  │  3 LLM Personas (DRY_RUN = deterministic mock, LIVE = real LLM)   │      │
+│  │       ↓                                                        │      │
+│  │  MoEWeighter + DynamicAllocator  ← Sortino-softmax allocation    │      │
+│  │       ↓                                                        │      │
+│  │  _simulate_trade_outcome()  ← close-only exit, RiskGuard in loop │      │
+│  │       ↓                                                        │      │
+│  │  ReflexionEvolver  ← lessons → MemoryBank (SQLite RAG)           │      │
+│  │  GeneticOptimizer  ← evolves ScannerConfig via params.py          │      │
+│  └──────────────────────────────────────────────────────────────────┘      │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## What's New in V3: The Autonomous AI Trading Floor
+## What's New in V4 — Wired Pipeline
 
-### 1. The Chronos Engine (Event-Driven Wakelock)
+### V4.2 — Complete System Audit (this release)
 
-Traditional LLM backtesting is bottlenecked by cost — processing every hourly candle with an LLM is prohibitively expensive and causes hallucinations from data overload. Plutus V3 introduces the **Chronos Engine**.
+- **10-agent architecture audit** covering: execution, risk, data layer, backtesting, CLI, dashboard, security, infrastructure, concurrency, state management, and parameter governance
+- **Execution layer fully wired**: SmartRouter → BinanceExecutor → RiskGuard → TimescaleDB all connected
+- **LiveExecutionNode** (`src/execution/__main__.py`) with full 6-connection pipeline
+- **IdempotentScannerWorker** wired into PlutusEngine as asyncio task
+- **Non-blocking RateLimiter** (Semaphore, no lock-during-sleep)
+- **RiskGuard** integrated into backtest loop
+- **13 strategy corpses** archived to `backups/strategies_archive/`
+- **Duplicate PairsTrader class** eliminated; second class renamed SpreadTrader
+- **Vectorized RSI** replacing Python for-loop
+- **Incremental EMA cache** in scanner
+- **Docker infrastructure** fixed (COPY paths, health checks, init-scripts, 5-service compose)
+- **params.py** single source of truth for all GA-evolvable scanner parameters
 
-- **Vanguard Scanner (Layer 1):** A blazing-fast, vectorised NumPy/Pandas radar that scans years of historical data in seconds. It filters out 99%+ of market noise using pure math — no LLM needed.
-- **Event-Driven Wakelock:** The costly LLM API is strictly dormant until the Scanner detects a severe mathematical anomaly. Only then does the engine "wake up" the AI committee.
-- **Result:** Backtesting that used to cost thousands of dollars in API fees now costs pennies, with drastically higher signal accuracy.
+### V4.1 — Active Command Console + Forensics Dashboard
 
-**Anomaly triggers:**
+- **Dashboard** (`src/dashboard/app.py`): real-time backtest forensics with live terminal streaming, equity curve, drawdown, win rate, heatmaps
+- **Dry-run banner**: synthetic results shown with explicit warning
+- **Scanner streaming**: Binance WebSocket + Redis pipeline
+- **PLUTUS_API_KEY** bearer-token auth on FastAPI endpoints
 
-| Trigger | Definition | Signal |
-|---------|-----------|--------|
-| `LIQUIDITY_SWEEP` | Price wicks below 20-bar rolling low, closes back above | BULLISH/BEARISH |
-| `EXTREME_DEVIATION` | Price > 2 ATR from EMA50 AND RSI < 35 or > 65 | BULLISH/BEARISH |
-| `VOLATILITY_SQUEEZE` | BB Width ≤ 5% above 20-bar rolling minimum | BULLISH/BEARISH/NEUTRAL |
+### V4 — Operation BLACK SWAN PREP
 
-**Scanner thresholds** (all tunable via `ScannerConfig`):
-- `sweep_lookback = 20` bars
-- `deviation_atr_multiplier = 2.0`
-- `rsi_oversold = 35 / rsi_overbought = 65`
-- `squeeze_lookback = 20` bars, `squeeze_threshold_pct = 5%`
+- **RiskGuard** (`src/execution/risk_limits.py`): 9 sequential checks — kill switch, global drawdown, fat-finger notional, correlated beta exposure, leverage circuit, session loss, liquidation buffer, equity floor, black swan
+- **Gate A/B** enforcement inside `calculate_position_size()`
+- **Correlation gate**: ALT longs blocked when BTC in downtrend or risk_level == HIGH
+- **Docker compose** with 5 services: plutus_engine, execution_node, scanner, timescaledb, redis
+- **TimescaleDB** hypertable schema for OHLCV, trades, scanner_events, portfolio_snapshots
 
-### 2. Mixture of Experts (MoE) Personas
+---
 
-When an anomaly fires, a committee of three distinct, deeply specialised LLM personas independently analyses the setup. No single persona dominates — capital is allocated algorithmically based on recent performance.
+## Quick Start
 
-| Persona | Specialty | Key Indicators |
-|---------|-----------|---------------|
-| **`SMC_ICT`** | Smart Money Concepts | Liquidity pools, FVGs, Market Structure Shifts, Order Blocks |
-| **`ORDER_FLOW`** | Market microstructure | Open Interest, funding rates, liquidation clusters, volume delta |
-| **`MACRO_ONCHAIN`** | Global macro + on-chain | ETF flows, whale wallets, MVRV, DXY, halving cycle regime |
+```bash
+# 1. Clone
+git clone https://github.com/Dingding-leo/plutus-trading.git
+cd plutus-trading
 
-**Response schema** (universal across all personas):
-```json
-{
-  "thesis": "1-3 sentence reasoning",
-  "direction": "LONG | SHORT | NEUTRAL",
-  "confidence_score": 0-100,
-  "recommended_leverage": 1-10,
-  "_warnings": ["edge-case caveats"]
-}
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Configure environment
+cp .env.example .env
+# Edit .env with your API keys (LLM_API_KEY, BINANCE_API_KEY, etc.)
+
+# 4. Run the dashboard
+streamlit run src/dashboard/app.py
+
+# 5. Run a backtest
+python -m src.cli backtest --symbols BTCUSDT --start 2022-01-01 --end 2024-12-31 --equity 10000
+
+# 6. Run live trading (Docker)
+cd docker && docker compose up -d
 ```
-
-### 3. The Quant Evaluator (Dynamic Portfolio Manager)
-
-Personas do not have equal power. A ruthless algorithmic Portfolio Manager evaluates their rolling performance using institutional metrics:
-
-- **Fitness formula:** `(Sortino × WinRate) / (1 + Turnover × Penalty)`
-- **Softmax allocation:** Capital is dynamically redistributed. If SMC_ICT is on a losing streak in chop, its weight drops toward `0.0` — ORDER_FLOW takes over seamlessly.
-- **Lookback window:** Rolling 30-epoch window (configurable)
-- **No LLM needed:** All math is pure Python/NumPy — zero API cost
-
-### 4. The Reflexion Memory Matrix (V3.1 — Self-Healing RAG)
-
-Plutus is not a static model — it learns from its own failures.
-
-**Post-Mortem Engine:** When a trade loses > 1%, the responsible LLM persona is forced to output a **1-sentence strict rule** about what went wrong.
-
-**SQLite Memory Bank** (`~/.plutus/memory.db`):
-```sql
-CREATE TABLE lessons (
-  id           INTEGER PRIMARY KEY,
-  timestamp    TEXT,
-  persona      TEXT,       -- e.g. "SMC_ICT"
-  anomaly_type TEXT,      -- e.g. "LIQUIDITY_SWEEP"
-  pnl          REAL,       -- signed % loss
-  thesis       TEXT,       -- what the persona believed
-  lesson       TEXT        -- 1-sentence rule the LLM produced
-);
-CREATE INDEX idx_persona_anomaly ON lessons (persona, anomaly_type);
-```
-
-**Retrieval-Augmented Generation (RAG):** Before evaluating a *new* anomaly, each persona queries the Memory Bank for past lessons on that anomaly type. Those lessons are injected into the LLM system prompt as a hard constraint block — the model literally cannot repeat the same mistake twice.
 
 ---
 
 ## CLI Commands
 
 ```bash
-# ── V1: Pure Rule-Based Engine ──────────────────────────────────
-python3 -m src.cli backtest --symbols BTCUSDT,ETHUSDT
+# ── Backtest ────────────────────────────────────────────────
+python -m src.cli backtest \
+  --symbols BTCUSDT,ETHUSDT \
+  --start 2022-01-01 --end 2024-12-31 \
+  --equity 10000 \
+  --v3-chronos --v3-mode dry_run
 
-# ── V2: Hybrid Engine (LLM Macro Risk Officer) ───────────────────
-python3 -m src.cli backtest --use-llm --llm-provider minimax --symbols BTCUSDT
+# ── Scan ─────────────────────────────────────────────────
+python -m src.cli scan --symbols BTCUSDT,ETHUSDT,SOLUSDT --market futures
 
-# ── V3: Chronos Event-Driven MoE (DRY RUN — no LLM calls) ──────
-python3 -m src.cli backtest --v3-chronos --v3-mode dry_run --symbols BTCUSDT
+# ── Trade Plan ───────────────────────────────────────────
+python -m src.cli trade --symbol BTCUSDT --direction BUY --risk-level MODERATE --equity 10000
 
-# ── V3: Chronos with real LLM personas (LIVE — API costs apply) ─
-python3 -m src.cli backtest --v3-chronos --v3-mode live --symbols BTCUSDT
+# ── Analyze ──────────────────────────────────────────────
+python -m src.cli analyze --save
 
-# ── V3: Tune scanner sensitivity ─────────────────────────────────
-python3 -m src.cli backtest --v3-chronos --v3-mode dry_run \
-  --symbols BTCUSDT --v3-equity 50000 --v3-min-confidence 50
-
-# ── V1: Full market analysis ─────────────────────────────────────
-python3 -m src.cli analyze --market futures
-
-# ── V1: Intraday scanner ─────────────────────────────────────────
-python3 -m src.cli scan --symbols BTCUSDT,ETHUSDT,SOLUSDT --market futures
-
-# ── V1: Generate trade plan ──────────────────────────────────────
-python3 -m src.cli trade --symbol BTCUSDT --direction BUY --risk-level MODERATE \
-  --equity 10000 --market futures
+# ── Feedback ────────────────────────────────────────────
+python -m src.cli feedback --date 2026-03-22
 ```
-
-### Backtest Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--v3-chronos` | `False` | Enable Chronos V3 engine (instead of V1/V2) |
-| `--v3-mode` | `dry_run` | `dry_run` (mock personas, no API cost) or `live` (real LLM calls) |
-| `--v3-equity` | `10000` | Initial equity for Chronos backtest |
-| `--v3-min-confidence` | `40` | Minimum blended confidence to execute a trade (0–100) |
-| `--use-llm` | `False` | Enable LLM Macro Risk Officer in V1/V2 backtest |
-| `--llm-provider` | `minimax` | LLM provider for V2 (`minimax`, `openai`, etc.) |
 
 ---
 
@@ -192,106 +162,127 @@ python3 -m src.cli trade --symbol BTCUSDT --direction BUY --risk-level MODERATE 
 
 ```
 src/
-├── cli.py                     # CLI entry point — routes V1/V2/V3 modes
-├── config.py                  # All configuration constants
-│
-├── analysis/
-│   ├── indicators.py          # EMA, RSI, ATR, SMA, momentum, volatility
-│   ├── volume_profile.py      # LVN/HVN, multi-TF resonance
-│   └── market_context.py      # Risk classification, macro state
+├── cli/                    # CLI refactored into commands/
+│   ├── commands/
+│   │   ├── analyze.py       # Market analysis
+│   │   ├── backtest.py      # ChronosBacktester
+│   │   ├── feedback.py      # Lesson logging
+│   │   ├── scan.py         # VanguardScanner
+│   │   └── trade.py        # Trade plan + validation
+│   └── main.py             # Entry point
 │
 ├── data/
-│   ├── binance_client.py      # Binance spot/futures OHLCV
-│   ├── coingecko_client.py    # Global metrics, Fear & Greed
-│   ├── coin_tiers.py          # Tier system + symbol normalisation
-│   ├── llm_client.py          # LLM client + Macro Risk Officer (V2)
-│   ├── personas.py             # 3 LLM personas + reflexion engine (V3)
-│   ├── scanner.py              # VanguardScanner — anomaly detector (V3)
-│   └── memory.py              # MemoryBank SQLite RAG store (V3.1)
+│   ├── binance_client.py   # Binance OHLCV + local data lake
+│   ├── coingecko_client.py  # Global market metrics
+│   ├── coin_tiers.py       # Tier system + symbol normalisation
+│   ├── llm_client.py        # LLM client (lazy-loaded)
+│   ├── memory.py            # SQLite MemoryBank RAG
+│   ├── personas.py          # 3 LLM personas + reflexion
+│   ├── scanner.py           # VanguardScanner (vectorised)
+│   └── streams/            # WebSocket clients
+│       ├── binance_websocket.py  # Binance real-time stream
+│       └── glassnode.py          # Glassnode metrics
+│
+├── analysis/
+│   ├── indicators.py       # EMA, RSI, ATR, SMA, momentum
+│   ├── volume_profile.py    # LVN/HVN, multi-TF resonance
+│   └── market_context.py    # Risk classification, macro state
+│
+├── models/
+│   ├── meta_learning.py    # MoEWeighter, GeneticOptimizer,
+│   │                         # ReflexionEvolver, DynamicAllocator
+│   └── params.py           # Single source for GA-evolvable params
 │
 ├── execution/
-│   ├── decision_engine.py     # 3-phase trading framework
-│   ├── position_sizer.py      # Risk-based position sizing
-│   └── trade_plan.py         # Standardised trade output
+│   ├── __main__.py         # LiveExecutionNode (live trading service)
+│   ├── exchanges/
+│   │   └── binance_executor.py  # Binance Futures execution
+│   ├── order_router.py     # SmartRouter: TWAP/VWAP/LimitQueue
+│   ├── portfolio_matrix.py # SpreadTrader, RiskManager, CorrelationEngine
+│   ├── position_sizer.py   # Gate A/B, calculate_max_leverage
+│   ├── risk_limits.py      # RiskGuard (9 checks)
+│   ├── trade_plan.py       # Standardised trade output + validation
+│   └── risk/               # Risk calculation utilities
+│
+├── engine/                  # Live infrastructure
+│   ├── __main__.py         # Docker entry point for plutus_engine
+│   ├── server.py           # FastAPI + Redis pub/sub
+│   ├── scanner_worker.py    # IdempotentScannerWorker
+│   ├── realtime_pipeline.py  # XADD → XREADGROUP pipeline
+│   └── scanner_cli.py       # BinanceConnector → XADD producer
 │
 ├── backtest/
-│   ├── engine.py             # BacktestEngine + MultiCoinBacktester
-│   ├── strategy.py            # WorkflowStrategy + HybridWorkflowStrategy
-│   ├── hybrid_strategy.py     # V2 Execution Gate + Volatility Shield
-│   ├── portfolio_manager.py   # DynamicAllocator + fitness math (V3)
-│   ├── chronos_engine.py      # ChronosBacktester orchestrator (V3)
-│   └── data_client.py         # Unified historical data fetching
+│   ├── chronos_engine.py    # ChronosBacktester (orchestrator)
+│   ├── engine.py            # BacktestEngine (V1)
+│   ├── strategy.py          # WorkflowStrategy
+│   ├── simple_fetch.py     # Historical data fetcher
+│   └── chronos/             # Chronos sub-modules
 │
-└── storage/
-    ├── daily_logger.py        # Daily analysis persistence
-    └── feedback_logger.py     # Feedback & learning log
+├── config.py                # Global constants
+└── dashboard/
+    ├── app.py              # Streamlit forensics dashboard
+    └── data_loader.py       # Dashboard data loader
 ```
 
 ---
 
-## V3 Internals
-
-### Fitness Math (DynamicAllocator)
-
-```python
-# Sortino: downside-only risk-adjusted return
-sortino = (mean_return - target) / downside_std
-
-# Fitness: penalise churn, reward consistency
-fitness = (sortino * win_rate) / (1 + turnover * penalty_factor)
-
-# Softmax allocation (temperature = 1.0)
-weights = softmax(fitness_scores, temperature=1.0)
-```
-
-### Chronos Outcome Simulation
-
-For dry-run backtesting, trade outcomes are simulated via 48-candle lookahead:
-- **WIN:** Take-Profit hit before Stop-Loss
-- **LOSS:** Stop-Loss hit before Take-Profit (or loss > 1% triggers reflexion)
-- **HOLD:** Neither level hit within 48 candles
-
-### Reflexion Trigger
+## Risk Guard (9 Sequential Checks)
 
 ```
-if trade_result == "LOSS" and pnl_pct < -1.0:
-    for persona in losing_voters:
-        rule = persona.reflect_on_loss(anomaly_type, thesis, pnl)
-        memory_bank.save_lesson(persona, anomaly_type, pnl, thesis, rule)
+check_all() order of evaluation:
+  [0] kill_switch           — permanent halt after session loss
+  [1] global_drawdown      — halt when equity < 92% of peak
+  [2] fat_finger_notional  — max notional per symbol (LIVE $5k, DRY $10k)
+  [3] correlated_exposure   — crypto beta > 50% when BTC downtrend
+  [4] leverage_circuit     — max leverage by risk level (5-15x)
+  [5] session_loss         — hard stop at -5% session loss
+  [6] liquidation_buffer   — 0.5% major / 1.5% small cap buffer
+  [7] absolute_equity_floor — permanent halt below $1,000
+  [8] black_swan          — flatten on -5% intraday drawdown
 ```
 
 ---
 
-## Position Sizing Rules
+## Docker Services
 
-### Risk Environment → Position Multiplier
+```bash
+cd docker
+docker compose up -d
 
-| Risk Level | Trigger | pos_mult |
-|-----------|---------|----------|
-| LOW | No news + normal volatility + clear structure | 1.0x–1.2x |
-| MODERATE | General news OR elevated volatility | 0.7x–1.0x |
-| HIGH | War/CPI/FOMC/SEC OR ATR ≥ 1.5× OR structure broken | 0.3x–0.5x |
-
-### V2 Execution Gate Rules
-
-| Condition | Action |
-|-----------|--------|
-| `macro_regime == RISK_OFF` | Block ALT LONG |
-| `btc_strength == WEAK` | Block all LONG |
-| `volatility == HIGH` | Force `pos_mult = 0.3×` (Volatility Shield) |
+# Services:
+#   plutus_engine :8000      FastAPI + IdempotentScannerWorker
+#   execution_node            LiveExecutionNode (BinanceExecutor)
+#   scanner                  BinanceConnector → Redis stream
+#   timescaledb :5432        OHLCV, fills, portfolio snapshots
+#   redis :6379               Pub/sub + orderbook stream (MAXLEN 50k, noeviction)
+```
 
 ---
 
 ## Requirements
 
 ```
+# Core
 requests>=2.28.0
-pandas
-numpy
-```
+pandas>=2.0.0
+numpy>=1.26.0
+aiohttp>=3.9.0
+redis>=5.0.0
+asyncpg>=0.29.0
 
-Install:
-```bash
+# Analysis
+ta>=0.11.0           # Technical indicators
+scikit-learn>=1.4.0  # ReflexionEvolver TF-IDF
+
+# LLM
+openai>=1.0.0         # or anthropic>=0.20.0
+
+# Infra
+streamlit>=1.30.0
+fastapi>=0.110.0
+uvicorn>=0.27.0
+python-dotenv>=1.0.0
+
 pip install -r requirements.txt
 ```
 
@@ -301,8 +292,10 @@ pip install -r requirements.txt
 
 | Source | Use |
 |--------|-----|
-| Binance fapi | Futures OHLCV (default, max 1500 candles/request) |
-| Binance api | Spot OHLCV |
-| CoinGecko | Global market metrics |
-| alternative.me | Fear & Greed Index |
-| LLM Provider API | Macro Risk Officer (V2), Persona analysis (V3) |
+| Binance fapi v1 | Futures OHLCV (primary) |
+| Binance spot api v3 | Spot OHLCV (fallback) |
+| CoinGecko | Global market cap, fear & greed |
+| Glassnode | On-chain metrics (OI, whale wallets, MVRV) |
+| LLM Provider (Minimax/OpenAI) | Persona analysis, reflexion |
+| TimescaleDB | OHLCV, fills, scanner events, portfolio snapshots |
+| Redis | Real-time orderbook stream, pub/sub signals |

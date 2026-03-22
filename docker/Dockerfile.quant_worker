@@ -1,0 +1,46 @@
+# ============================================================
+# Plutus Quant Worker — Isolated Backtest Sandbox
+# Base: python:3.10-slim  |  Size: ~350 MB
+# ============================================================
+
+FROM python:3.10-slim AS quant_worker
+
+# ── Env ──────────────────────────────────────────────────────
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── System deps ──────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    tmux \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python deps ──────────────────────────────────────────────
+COPY --from=python:3.10-slim /usr/local/lib/python3.10/lib/python3.10/site-packages/pip /
+
+RUN python3 -m pip install --no-cache-dir \
+    pandas \
+    numpy \
+    requests \
+    python-binance \
+    ta-lib \
+    2>/dev/null || \
+    python3 -m pip install --no-cache-dir \
+    pandas \
+    numpy \
+    requests \
+    python-binance \
+    ta \
+    # fallback: ta (pure-python, no C deps)
+
+# ── Workspace ────────────────────────────────────────────────
+WORKDIR /app
+
+# ── Healthcheck ──────────────────────────────────────────────
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python3 -c "import pandas, numpy, requests" || exit 1
+
+# ── Entrypoint (keeps tmux alive for docker exec access) ──────
+CMD ["tmux", "new-session", "-d", "-s", "plutus_worker", "bash -l"]

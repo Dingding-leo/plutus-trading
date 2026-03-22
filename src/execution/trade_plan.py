@@ -126,8 +126,8 @@ def format_trade_plan(plan: dict) -> str:
 
     # Warning for small stops
     stop_dist = plan.get("stop_distance_pct", 0)
-    if stop_dist < 0.7:
-        output += "⚠️ **WARNING:** Stop distance is very small (<0.7%). Consider wider stop or smaller position.\n"
+    if stop_dist < 0.5:
+        output += "⚠️ **WARNING:** Stop distance is very small (<0.5%). Consider wider stop or smaller position.\n"
 
     return output
 

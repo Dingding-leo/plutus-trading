@@ -71,6 +71,7 @@ def calculate_position_size(
     pos_mult: float = 1.0,
     coin_type: str = "major",
     training_mode: bool = True,
+    risk_level: str = "LOW",
 ) -> dict:
     """
     Calculate position size based on risk parameters.
@@ -82,6 +83,7 @@ def calculate_position_size(
         pos_mult: Position multiplier from risk level
         coin_type: 'major' or 'small'
         training_mode: If True, cap at 1x; if False, cap at 1.5x
+        risk_level: 'LOW', 'MODERATE', or 'HIGH' — used for Gate A enforcement
 
     Returns:
         Dict with position details
@@ -110,12 +112,25 @@ def calculate_position_size(
 
     max_position = effective_risk / stop_distance
 
-    # Apply Gate B: Position cap
+    # Apply Gate A: BLOCK trades with dangerously tight stops in HIGH risk
+    # Raises PositionSizingBlocked if the trade must be rejected.
+    try:
+        apply_gates(stop_distance=stop_distance, risk_level=risk_level)
+    except PositionSizingBlocked as e:
+        return {
+            "valid": False,
+            "error": e.reason,
+        }
+
+    # Apply Gate B: Position cap — uses the correct cap based on training_mode.
+    # This was the CRITICAL bug: the old code always hardcoded TRAINING_CAP (1.0x)
+    # regardless of the training_mode parameter, causing 40% systematic under-sizing.
+    gate_applied: str | None = None
     cap = config.POSITION_CAP_TRAINING if training_mode else config.POSITION_CAP_ADVANCED
     max_cap = equity * cap
-
     if max_position > max_cap:
         max_position = max_cap
+        gate_applied = "Gate B: Position cap"
 
     # Calculate max leverage
     leverage_result = calculate_max_leverage(stop_distance, coin_type)
@@ -150,49 +165,52 @@ def calculate_position_size(
         "max_leverage": max_leverage,
         "recommended_leverage": recommended_leverage,
         "position_as_pct_of_equity": max_position / equity * 100,
+        "gate_applied": gate_applied,
     }
+
+
+class PositionSizingBlocked(Exception):
+    """
+    Raised when position sizing determines a trade must be blocked.
+    Caught by the execution layer to halt the trade.
+    """
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(f"[POSITION BLOCKED] {reason}")
 
 
 def apply_gates(
     stop_distance: float,
     risk_level: str,
-    position_value: float,
-    equity: float,
-) -> tuple[float, str]:
+) -> None:
     """
-    Apply Gate A and Gate B checks.
+    Apply Gate A check only.
+
+    Gate A blocks trades with dangerously tight stops in HIGH risk environments.
+    Does NOT apply any position cap — that is handled by calculate_position_size.
 
     Args:
         stop_distance: Stop loss distance as decimal
         risk_level: 'LOW', 'MODERATE', or 'HIGH'
-        position_value: Calculated position value
-        equity: Total equity
 
-    Returns:
-        Tuple of (adjusted_position, gate_applied)
+    Raises:
+        PositionSizingBlocked: Gate A blocks the trade (tight stop in HIGH risk).
     """
-    gate_applied = None
-
-    # Gate A: Small stop penalty
+    # Gate A: BLOCK trades with dangerously tight stops in HIGH risk
+    # Gate A must raise — not merely reduce — to enforce the hard block.
     if stop_distance < config.SMALL_STOP_THRESHOLD and risk_level == "HIGH":
-        # Force smaller position
-        position_value = position_value * 0.3
-        gate_applied = "Gate A: Small stop penalty"
-
-    # Gate B: Position cap
-    cap = config.POSITION_CAP_TRAINING
-    max_allowed = equity * cap
-
-    if position_value > max_allowed:
-        position_value = max_allowed
-        gate_applied = "Gate B: Position cap"
-
-    return position_value, gate_applied
+        raise PositionSizingBlocked(
+            f"Gate A: stop_distance {stop_distance*100:.2f}% < "
+            f"{config.SMALL_STOP_THRESHOLD*100:.1f}% threshold in HIGH risk. "
+            f"Widen stop to at least {config.SMALL_STOP_THRESHOLD*100:.1f}% or "
+            f"do not trade in HIGH risk with tight stops."
+        )
 
 
 def generate_tranche_plan(
     position_value: float,
-    current_price: float,
+    entry_price: float,
     direction: str = "long",
 ) -> dict:
     """
@@ -200,7 +218,7 @@ def generate_tranche_plan(
 
     Args:
         position_value: Total position value
-        current_price: Current price
+        entry_price: Intended entry price (or mid-point of the entry zone)
         direction: 'long' or 'short'
 
     Returns:
@@ -212,15 +230,15 @@ def generate_tranche_plan(
     tranche_3 = position_value * 0.2
 
     if direction == "long":
-        # Entry prices (limit orders below current)
-        entry_1 = current_price * 0.995  # 0.5% below
-        entry_2 = current_price * 0.99   # 1% below
-        entry_3 = current_price * 0.985  # 1.5% below
+        # Entry prices (limit orders below entry_price)
+        entry_1 = entry_price * 0.995  # 0.5% below
+        entry_2 = entry_price * 0.99   # 1% below
+        entry_3 = entry_price * 0.985  # 1.5% below
     else:
         # Short entries
-        entry_1 = current_price * 1.005  # 0.5% above
-        entry_2 = current_price * 1.01   # 1% above
-        entry_3 = current_price * 1.015  # 1.5% above
+        entry_1 = entry_price * 1.005  # 0.5% above
+        entry_2 = entry_price * 1.01   # 1% above
+        entry_3 = entry_price * 1.015  # 1.5% above
 
     return {
         "tranche_1": {

@@ -42,6 +42,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -245,6 +246,59 @@ class RiskGuard:
     # Correlated beta symbol sets (hardcoded reference — also in YAML)
     CRYPTO_BETA_SYMBOLS: List[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
 
+    # ── Singleton registry ────────────────────────────────────────────────────────
+    # Key = (mode, config_path). Value = RiskGuard instance.
+    _instances: Dict[Tuple[str, str], "RiskGuard"] = {}
+
+    @classmethod
+    def get_instance(
+        cls,
+        equity: float,
+        mode: str = "live",
+        config_path: str = "config/risk_limits.yaml",
+        initial_capital: Optional[float] = None,
+    ) -> "RiskGuard":
+        """
+        Get or create the singleton RiskGuard for this (mode, config_path) pair.
+
+        Repeated calls with the same (mode, config_path) arguments return the
+        SAME instance, ensuring all components (BinanceExecutor, execution
+        engine, CLI) share a single source of truth for position state.
+
+        Args:
+            equity:         Current account equity.
+            mode:          'live' or 'dry_run'.
+            config_path:    Path to risk_limits.yaml.
+            initial_capital: Override for initial capital.
+
+        Returns:
+            Shared RiskGuard instance.
+        """
+        key = (mode, config_path)
+        if key not in cls._instances:
+            cls._instances[key] = cls(
+                equity=equity,
+                mode=mode,
+                config_path=config_path,
+                initial_capital=initial_capital,
+            )
+        else:
+            existing = cls._instances[key]
+            existing.equity = equity
+            if initial_capital is not None:
+                existing.initial_capital = initial_capital
+        return cls._instances[key]
+
+    @classmethod
+    def reset_instance(cls, mode: str = "live", config_path: str = "config/risk_limits.yaml") -> None:
+        """Clear the singleton for a given mode/config pair."""
+        cls._instances.pop((mode, config_path), None)
+
+    @classmethod
+    def reset_all_instances(cls) -> None:
+        """Clear all singleton instances. Use for testing."""
+        cls._instances.clear()
+
     def __init__(
         self,
         equity: float,
@@ -296,8 +350,12 @@ class RiskGuard:
         # ── Kill switch flag (permanent until reset) ─────────────────────────
         self._permanent_kill: bool = False
 
-        # ── Exposure tracking ────────────────────────────────────────────────
-        self._open_exposure: Dict[str, float] = {}  # symbol -> notional value
+        # ── Exposure tracking (thread-safe) ──────────────────────────────────
+        # Each symbol maps to {"long": notional, "short": notional}.
+        # Net exposure = long - short.  This prevents BTC long + BTC short
+        # from being double-counted as $10k when it should be $0.
+        self._open_exposure: Dict[str, Dict[str, float]] = {}
+        self._exposure_lock = threading.RLock()       # guards all _open_exposure access
 
         # ── Alert state ──────────────────────────────────────────────────────
         self._alerts_fired: Dict[str, bool] = {}  # alert_name -> already_fired
@@ -318,6 +376,11 @@ class RiskGuard:
             current_equity=self.equity,
             trade_count=0,
         )
+        # Reset the consecutive-session-stop counter at the start of each new session.
+        # The counter tracks consecutive sessions that each hit the hard-stop loss.
+        # A session that ends without hitting the hard stop breaks the streak and
+        # resets the counter to 0, so only truly consecutive max-risk sessions count.
+        self._consecutive_session_stops = 0
         return self._session
 
     def update_equity(self, equity: float, trade_count_delta: int = 0) -> None:
@@ -349,37 +412,210 @@ class RiskGuard:
             self._session.current_equity = equity
             self._session.trade_count += trade_count_delta
 
-    def record_trade(self, notional: float, symbol: str) -> None:
+    def record_trade(self, notional: float, symbol: str, direction: str = "long") -> None:
         """
         Record a trade into open exposure tracking.
 
         Args:
-            notional: Notional value of the position.
+            notional: Absolute notional value of the position.
             symbol: Trading pair symbol.
+            direction: 'long' or 'short'. Determines which bucket is updated.
         """
-        if symbol not in self._open_exposure:
-            self._open_exposure[symbol] = 0.0
-        self._open_exposure[symbol] += notional
+        with self._exposure_lock:
+            if symbol not in self._open_exposure:
+                self._open_exposure[symbol] = {"long": 0.0, "short": 0.0}
+            if direction == "long":
+                self._open_exposure[symbol]["long"] += notional
+            else:
+                self._open_exposure[symbol]["short"] += notional
 
-    def close_position(self, notional: float, symbol: str) -> None:
+    def close_position(self, notional: float, symbol: str, direction: str = "long") -> None:
         """
         Remove a position from open exposure tracking.
 
         Args:
-            notional: Notional value of the position to remove.
+            notional: Absolute notional value of the position to remove.
             symbol: Trading pair symbol.
+            direction: 'long' or 'short'. Determines which bucket is reduced.
         """
-        if symbol in self._open_exposure:
-            self._open_exposure[symbol] = max(0.0, self._open_exposure[symbol] - notional)
+        with self._exposure_lock:
+            if symbol in self._open_exposure:
+                if direction == "long":
+                    self._open_exposure[symbol]["long"] = max(
+                        0.0, self._open_exposure[symbol]["long"] - notional
+                    )
+                else:
+                    self._open_exposure[symbol]["short"] = max(
+                        0.0, self._open_exposure[symbol]["short"] - notional
+                    )
 
-    def flatten_all_positions(self) -> Dict[str, float]:
+    def update_position_from_fill(
+        self,
+        symbol: str,
+        side: str,
+        notional: float,
+        quantity: float,
+        price: float,
+    ) -> None:
         """
-        Emergency flatten: clear all open exposure.
-        Returns the exposure that was cleared (for logging).
+        Call this after every exchange fill to keep RiskGuard's exposure state
+        in sync with BinanceExecutor. This is the single write path for
+        _open_exposure in live mode.
+
+        Args:
+            symbol:    Trading pair, e.g. "BTCUSDT".
+            side:      "BUY" or "SELL".
+            notional:  Fill notional value in quote currency (USD).
+            quantity:  Base-asset fill quantity.
+            price:     Fill price.
         """
-        cleared = dict(self._open_exposure)
-        self._open_exposure.clear()
-        return cleared
+        with self._exposure_lock:
+            if symbol not in self._open_exposure:
+                self._open_exposure[symbol] = {"long": 0.0, "short": 0.0}
+            if side == "BUY":
+                self._open_exposure[symbol]["long"] += notional
+            else:  # SELL
+                self._open_exposure[symbol]["short"] += notional
+
+    def get_open_exposure(self) -> Dict[str, float]:
+        """
+        Return a snapshot of net open position notionals (long - short per symbol).
+        Thread-safe copy of _open_exposure with direction-awareness applied.
+        """
+        with self._exposure_lock:
+            return {
+                symbol: data["long"] - data["short"]
+                for symbol, data in self._open_exposure.items()
+            }
+
+    def flatten_all_positions(
+        self,
+        binance_executor: Any = None,
+        timeout_seconds: float = 30.0,
+    ) -> Dict[str, Any]:
+        """
+        Emergency flatten: close all open positions via the exchange, then
+        clear the in-memory exposure state.
+
+        Steps:
+            1. Query real positions from Binance (or mock in dry_run).
+            2. For each non-zero position, send a MARKET SELL (long) or
+               MARKET BUY (short) to close it.
+            3. Wait for fills (up to timeout_seconds total).
+            4. Verify all positions are zero.
+            5. Clear _open_exposure.
+
+        Args:
+            binance_executor:  BinanceExecutor instance (required in live mode).
+            timeout_seconds:   Max time to wait for fill confirmations.
+
+        Returns:
+            Dict with keys:
+                - success: bool
+                - cleared: Dict[str, float] — symbols and notionals that were cleared
+                - errors: List[str] — any symbols that failed to close
+                - fills: List[dict] — details of each fill
+        """
+        import logging
+        import time as _time
+
+        logger = logging.getLogger(__name__)
+        result: Dict[str, Any] = {
+            "success": False,
+            "cleared": {},
+            "errors": [],
+            "fills": [],
+        }
+
+        # Step 1: get real positions
+        positions: Dict[str, dict] = {}
+        if binance_executor is not None:
+            try:
+                for sym in list(self._open_exposure.keys()):
+                    pos = binance_executor.get_position(sym)
+                    if pos and abs(pos.get("size", 0.0)) > 1e-9:
+                        positions[sym] = pos
+            except Exception as exc:
+                logger.error("[RiskGuard] flatten: failed to query positions: %s", exc)
+                result["errors"].append(f"position_query_failed: {exc}")
+        else:
+            # dry_run: use in-memory state only
+            with self._exposure_lock:
+                for sym, data in self._open_exposure.items():
+                    net = data["long"] - data["short"]
+                    if abs(net) > 1e-9:
+                        positions[sym] = {"size": net}
+
+        # Step 2: send market orders to close each position
+        start_time = _time.time()
+        for sym, pos in positions.items():
+            size = abs(pos.get("size", 0.0))
+            if size < 1e-9:
+                continue
+
+            if binance_executor is not None:
+                # Determine close side
+                close_side = "SELL" if pos.get("size", 0) > 0 else "BUY"
+                try:
+                    fill_result = binance_executor.place_order(
+                        symbol=sym,
+                        side=close_side,
+                        order_type="MARKET",
+                        quantity=size,
+                        price=None,
+                    )
+                    result["fills"].append({
+                        "symbol": sym,
+                        "side": close_side,
+                        "quantity": size,
+                        "fill_result": fill_result,
+                    })
+                    logger.warning(
+                        "[RiskGuard] FLATTEN: %s %s qty=%.6f",
+                        close_side, sym, size,
+                    )
+                except Exception as exc:
+                    logger.error("[RiskGuard] flatten %s failed: %s", sym, exc)
+                    result["errors"].append(f"{sym}: {exc}")
+            else:
+                # dry_run: just record it
+                result["fills"].append({"symbol": sym, "side": "DRY_RUN", "quantity": size})
+
+        # Step 3: wait for fills (polling loop for live)
+        if binance_executor is not None and result["fills"]:
+            poll_interval = 0.5
+            while _time.time() - start_time < timeout_seconds:
+                all_closed = True
+                for sym in list(positions.keys()):
+                    pos = binance_executor.get_position(sym)
+                    if pos and abs(pos.get("size", 0.0)) > 1e-9:
+                        all_closed = False
+                        break
+                if all_closed:
+                    break
+                _time.sleep(poll_interval)
+
+        # Step 4: verify and clear in-memory state
+        with self._exposure_lock:
+            result["cleared"] = dict(self._open_exposure)
+            self._open_exposure.clear()
+
+        # Step 5: final verification
+        if binance_executor is not None:
+            for sym in list(result["cleared"].keys()):
+                pos = binance_executor.get_position(sym)
+                if pos and abs(pos.get("size", 0.0)) > 1e-9:
+                    result["errors"].append(
+                        f"{sym}: position still open after flatten "
+                        f"(size={pos.get('size')})"
+                    )
+
+        result["success"] = len(result["errors"]) == 0
+        logger.warning(
+            "[RiskGuard] flatten_all_positions complete: success=%s  errors=%s",
+            result["success"], result["errors"],
+        )
+        return result
 
     def reset_daily(self) -> None:
         """Manually reset daily peak. Call at start of each trading day."""
@@ -443,30 +679,50 @@ class RiskGuard:
     # ── Exposure Helpers ─────────────────────────────────────────────────
 
     def _crypto_beta_exposure(self, proposed: Dict[str, float]) -> float:
-        """Sum of notional exposure to crypto beta symbols (existing + proposed)."""
+        """Net notional exposure to crypto beta symbols (existing + proposed).
+
+        Uses net = long - short per symbol so that a BTC long and BTC short
+        of equal size correctly sum to zero exposure.
+        """
+        # Snapshot dict items under lock to avoid iterating during mutation
+        with self._exposure_lock:
+            existing_items = list(self._open_exposure.items())
         total = 0.0
-        for symbol, notional in self._open_exposure.items():
+        for symbol, data in existing_items:
             if symbol in self.CRYPTO_BETA_SYMBOLS:
-                total += notional
+                # Net exposure: longs minus shorts
+                total += data["long"] - data["short"]
         for symbol, notional in (proposed or {}).items():
             if symbol in self.CRYPTO_BETA_SYMBOLS:
                 total += notional
         return total
 
     def _alt_beta_exposure(self, proposed: Dict[str, float]) -> float:
-        """Sum of notional exposure to alt beta symbols (existing + proposed)."""
+        """Net notional exposure to alt beta symbols (existing + proposed).
+
+        Uses net = long - short per symbol so that opposing alt positions
+        do not inflate total exposure.
+        """
+        # Snapshot dict items under lock to avoid iterating during mutation
+        with self._exposure_lock:
+            existing_items = list(self._open_exposure.items())
         total = 0.0
-        for symbol, notional in self._open_exposure.items():
+        for symbol, data in existing_items:
             if symbol not in self.CRYPTO_BETA_SYMBOLS:
-                total += notional
+                # Net exposure: longs minus shorts
+                total += data["long"] - data["short"]
         for symbol, notional in (proposed or {}).items():
             if symbol not in self.CRYPTO_BETA_SYMBOLS:
                 total += notional
         return total
 
     def _total_open_notional(self, proposed_notional: float = 0.0) -> float:
-        """Total notional of all open positions plus proposed trade."""
-        return sum(self._open_exposure.values()) + proposed_notional
+        """Net notional of all open positions (longs minus shorts) plus proposed trade."""
+        with self._exposure_lock:
+            return sum(
+                data["long"] - data["short"]
+                for data in self._open_exposure.values()
+            ) + proposed_notional
 
     # ── Alert Helpers ─────────────────────────────────────────────────────
 
@@ -816,9 +1072,40 @@ class RiskGuard:
 
         return True, ""
 
+    def check_minimum_notional(
+        self,
+        proposed_notional: float,
+        binance_min_notional_usdt: float = 5.0,
+    ) -> Tuple[bool, str]:
+        """
+        [8] Binance minimum notional — reject orders below the exchange minimum.
+
+        Binance silently rejects orders whose notional value (price x quantity)
+        falls below its per-symbol minimum (typically 5 USDT).  This check
+        prevents those rejections by failing fast before the order is submitted.
+
+        Args:
+            proposed_notional: Size of the proposed trade in USD.
+            binance_min_notional_usdt: Minimum notional in USDT (default 5.0).
+
+        Returns:
+            (passed, reason).
+        """
+        cfg = self._config.get("minimum_notional", {})
+        min_notional = cfg.get("binance_min_notional_usdt", binance_min_notional_usdt)
+
+        if proposed_notional < min_notional:
+            return False, (
+                f"Proposed notional {_format_usd(proposed_notional)} is below "
+                f"Binance minimum notional {_format_usd(min_notional)}. "
+                f"Increase quantity or price to meet the minimum, or skip this trade."
+            )
+
+        return True, ""
+
     def check_daily_drawdown_black_swan(self) -> Tuple[bool, str]:
         """
-        [8] V4 Black Swan: auto-flatten if daily drawdown exceeds auto-flatten threshold.
+        [9] V4 Black Swan: auto-flatten if daily drawdown exceeds auto-flatten threshold.
 
         This check does NOT block a new trade — it indicates whether the
         flatten trigger has fired. Callers should use the result to close
@@ -1026,14 +1313,24 @@ class RiskGuard:
             ("session_loss",          self.check_session_loss(session_loss_pct)),
         ]
 
-        # Liquidation buffer only if distance was provided
-        if distance_to_liquidation_pct is not None:
-            checks.append(
-                ("liquidation_buffer", self.check_liquidation_buffer(distance_to_liquidation_pct, coin_type))
-            )
+        # Liquidation buffer: if not explicitly provided, use a conservative default (10%)
+        # so the check is never silently skipped. Callers should always pass the real value.
+        effective_liquidation_pct = (
+            distance_to_liquidation_pct
+            if distance_to_liquidation_pct is not None
+            else 0.10
+        )
+        checks.append(
+            ("liquidation_buffer", self.check_liquidation_buffer(effective_liquidation_pct, coin_type))
+        )
 
         checks.append(
             ("absolute_equity_floor", self.check_absolute_equity(equity_to_check))
+        )
+
+        # Binance minimum notional check
+        checks.append(
+            ("minimum_notional", self.check_minimum_notional(proposed_notional))
         )
 
         # Run all checks (fail-fast on first failure)
@@ -1058,6 +1355,14 @@ class RiskGuard:
         """
         Return a snapshot of all risk guard state. Useful for logging and monitoring.
         """
+        # Snapshot exposure under lock to avoid dict iteration during mutation
+        with self._exposure_lock:
+            open_exposure_snapshot = dict(self._open_exposure)
+            total_open_notional = sum(
+                data["long"] - data["short"]
+                for data in self._open_exposure.values()
+            )
+
         return {
             "mode": self.mode,
             "equity": self.equity,
@@ -1069,8 +1374,8 @@ class RiskGuard:
                 (self.equity - self._daily_peak_equity) / self._daily_peak_equity
                 if self._daily_peak_equity > 0 else 0.0
             ),
-            "open_exposure": dict(self._open_exposure),
-            "total_open_notional": self._total_open_notional(),
+            "open_exposure": open_exposure_snapshot,
+            "total_open_notional": total_open_notional,
             "kill_switch_active": self.kill_switch_active,
             "kill_switch_permanent": self._permanent_kill,
             "consecutive_session_stops": self._consecutive_session_stops,

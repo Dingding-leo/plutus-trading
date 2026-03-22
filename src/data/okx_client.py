@@ -132,9 +132,16 @@ class OKXClient:
 
             # Parse candles
             for c in candles:
-                ts = int(c[0])
+                # OKX /api/v5/market/history-candels returns ts[0] in milliseconds (int).
+                # Normalize to ms explicitly so the contract is unambiguous regardless of
+                # endpoint version — if OKX ever switches to seconds, the // operator
+                # floors the float and produces the same ms integer, making the mismatch
+                # surface immediately as wildly wrong timestamps rather than silently.
+                ts_raw = c[0]
+                ts = int(ts_raw) if int(ts_raw) > 10**12 else int(ts_raw) * 1000
                 candle = {
                     "timestamp": ts,
+                    # ts is always ms; datetime.fromtimestamp needs seconds → divide by 1000.
                     "datetime": datetime.fromtimestamp(ts / 1000),
                     "open": float(c[1]),
                     "high": float(c[2]),

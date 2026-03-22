@@ -35,6 +35,40 @@ from typing import Any, Dict, List, Optional
 from .llm_client import LLMClient
 
 
+# ─── Prompt Injection Sanitization ────────────────────────────────────────────
+
+def sanitize_field(value: Any, max_len: int = 2000) -> str:
+    """
+    P0-FIX (#12): Sanitize a market-data value before injecting it into a prompt.
+
+    Removes / escapes:
+      - Markdown and formatting characters that could tilt prompt styling
+      - Single/double quotes and backslashes that could break string literals
+      - Control characters (0x00-0x1F) that could corrupt prompt structure
+
+    Strips to max_len to prevent token-bomb / DoS on the LLM context window.
+    Returns "N/A" for None / empty values.
+    """
+    if value is None:
+        return "N/A"
+    raw = str(value)
+    if not raw.strip():
+        return "N/A"
+    # Remove control chars (below 0x20 except \n\r\t which we keep as escaped)
+    raw = "".join(c for c in raw if ord(c) >= 32 or c in "\n\r\t")
+    # Escape backslashes first (before other replacements)
+    raw = raw.replace("\\", "\\\\")
+    # Escape quotes (both styles — the prompt uses double-quote delimiters)
+    raw = raw.replace('"', '\\"')
+    raw = raw.replace("'", "\\'")
+    # Collapse runs of whitespace to a single space (keeps multi-line data readable-ish)
+    raw = re.sub(r"[ \t]+", " ", raw)
+    # Truncate
+    if len(raw) > max_len:
+        raw = raw[:max_len] + "..."
+    return raw
+
+
 # ─── Enums ────────────────────────────────────────────────────────────────────
 
 class PersonaType(Enum):
@@ -94,18 +128,39 @@ FALLBACK_SIGNAL = {
 }
 
 
+class _SignalValidationError(Exception):
+    """Raised when the LLM response is missing required schema fields."""
+    pass
+
+
+# Required fields for a valid trade-signal response (Issue #33)
+_REQUIRED_SIGNAL_FIELDS = {"direction", "confidence_score", "recommended_leverage"}
+
+
 def _parse_signal_response(raw: str, persona: PersonaType) -> Dict[str, Any]:
-    """Parse and validate a persona's JSON response against the universal schema."""
+    """Parse and validate a persona's JSON response against the universal schema.
+
+    Raises _SignalValidationError if any required field is completely absent;
+    the caller (BasePersona.analyze) catches this and falls back to FALLBACK_SIGNAL
+    rather than silently filling in None (Issue #33).
+    """
     start = raw.find('{')
     end = raw.rfind('}')
-    
+
     if start == -1 or end == -1 or end < start:
-        return {**FALLBACK_SIGNAL, "persona": persona.value}
+        raise _SignalValidationError("No JSON object found in LLM response")
 
     try:
         parsed = json.loads(raw[start:end+1])
-    except json.JSONDecodeError:
-        return {**FALLBACK_SIGNAL, "persona": persona.value}
+    except json.JSONDecodeError as e:
+        raise _SignalValidationError(f"JSON decode error: {e}")
+
+    # --- Schema validation: required fields must be present (Issue #33) ---
+    missing = _REQUIRED_SIGNAL_FIELDS - set(parsed.keys())
+    if missing:
+        raise _SignalValidationError(
+            f"Missing required fields: {', '.join(sorted(missing))}"
+        )
 
     # Direction enum guard
     raw_dir = parsed.get("direction", "NEUTRAL").upper().strip()
@@ -415,6 +470,16 @@ class BasePersona:
                 persona=self.persona_type,
                 warnings=parsed["_warnings"],
             )
+        except _SignalValidationError as e:
+            # Schema validation failure — fall back to safe NEUTRAL (Issue #33)
+            return PersonaSignal(
+                thesis=f"Schema validation failed: {e}",
+                direction=Direction.NEUTRAL,
+                confidence=0,
+                leverage=1,
+                persona=self.persona_type,
+                warnings=[f"LLM response missing required fields — NO_TRADE enforced. Detail: {e}"],
+            )
         except Exception as e:
             return PersonaSignal(
                 thesis=f"Persona {self.persona_type.value} error: {e}",
@@ -435,8 +500,44 @@ class BasePersona:
 
         The injected block is placed at the very end of the system prompt so
         it is the last thing the model reads before responding.
+
+        Security (Issue #51):
+        - Truncates to at most _MAX_LESSONS entries (oldest discarded) to
+          prevent unbounded prompt bloat.
+        - Each entry is validated: must be a non-empty string under 500 chars
+          and must not contain obvious prompt-injection patterns. Entries that
+          fail validation are dropped with a warning rather than included.
         """
         if not past_lessons:
+            return system_prompt
+
+        # --- Injection pattern guard ---
+        _INJECTION_PATTERNS = [
+            re.compile(r"\bignore\s+(all\s+)?(previous|above|prior)\b", re.IGNORECASE),
+            re.compile(r"\bforget\s+(all\s+)?(previous|above|prior)\b", re.IGNORECASE),
+            re.compile(r'^system\s*:', re.IGNORECASE),
+            re.compile(r'^you\s+are\s+', re.IGNORECASE),
+            re.compile(r'\b{jailbreak}\b', re.IGNORECASE),
+        ]
+
+        MAX_LESSONS = 20
+        MAX_LESSON_LEN = 500
+
+        validated: List[str] = []
+        for lesson in past_lessons:
+            if not isinstance(lesson, str) or not lesson.strip():
+                continue  # skip non-strings and empty entries
+            if len(lesson) > MAX_LESSON_LEN:
+                lesson = lesson[:MAX_LESSON_LEN]  # truncate oversized entries
+            # Reject entries matching injection patterns
+            if any(p.search(lesson) for p in _INJECTION_PATTERNS):
+                continue
+            validated.append(lesson)
+
+        # Truncate to last MAX_LESSONS to prevent unbounded growth
+        validated = validated[-MAX_LESSONS:]
+
+        if not validated:
             return system_prompt
 
         lessons_block = (
@@ -444,7 +545,7 @@ class BasePersona:
             "══════════════════════════════════════════════════════════════\n"
             "CRITICAL PAST LESSONS — YOU MUST NOT REPEAT THESE MISTAKES:\n"
             "══════════════════════════════════════════════════════════════\n"
-            + "\n".join(f"- {lesson}" for lesson in past_lessons)
+            + "\n".join(f"- {lesson}" for lesson in validated)
             + "\n══════════════════════════════════════════════════════════════\n"
             "IMPORTANT: The rules above were learned from real losses. Apply them.\n"
             "══════════════════════════════════════════════════════════════\n"
@@ -483,13 +584,31 @@ class BasePersona:
                 f"(thesis: {thesis[:60]}...) but no LLM call is made in dry_run."
             )
 
+        # P0-FIX (#13): escape thesis and market_context before injecting into
+        # the prompt to prevent a malicious LLM response from breaking out of
+        # the string context and injecting arbitrary content.
+        def _escape(s: str) -> str:
+            """Escape quotes, backslashes, newlines, and control chars for prompt injection safety."""
+            s = s.replace("\\", "\\\\")
+            s = s.replace('"', '\\"')
+            s = s.replace("'", "\\'")
+            s = s.replace("\n", "\\n")
+            s = s.replace("\r", "\\r")
+            s = s.replace("\t", "\\t")
+            # Strip remaining control chars (0x00-0x1F except \n\r\t)
+            s = "".join(c for c in s if ord(c) >= 32 or c in "\n\r\t")
+            return s
+
+        escaped_thesis = _escape(thesis)
+        escaped_context = _escape(market_context) if market_context else "Not available."
+
         reflexion_prompt = (
             f"You are a {self.persona_type.value} trading persona.\n"
             f"You recently took a LOSS of {pnl:.2f}% on a {anomaly_type} setup.\n"
             f"Your thesis entering the trade was:\n"
-            f"  \"{thesis}\"\n"
+            f"  \"{escaped_thesis}\"\n"
             f"Market context:\n"
-            f"  {market_context or 'Not available.'}\n\n"
+            f"  {escaped_context}\n\n"
             f"Analyze what went wrong. Output ONLY a single, strict, actionable "
             f"1-sentence rule that you will NEVER violate again.\n"
             f"Output format: just the sentence, no quotes, no explanation.\n"
@@ -539,26 +658,28 @@ class SMC_ICT_Persona(BasePersona):
         fg_str  = str(fg_raw) if fg_raw is not None else "NA"
 
         def _safe(v, default="N/A"):
+            # Numeric-only formatting — no user-text injection risk
             return f"${v:,.2f}" if isinstance(v, (int, float)) else default
 
         tf_lines = []
         for tf_name, tf_data in multi.items():
             if not tf_data:
                 continue
+            # P0-FIX (#12): sanitize all text fields from market data before injection
             tf_lines.append(
-                f"{tf_name.upper()}:\n"
+                f"{sanitize_field(tf_name)}:\n"
                 f"  Price: {_safe(tf_data.get('close'))}\n"
-                f"  Trend: {tf_data.get('trend', 'N/A')}\n"
+                f"  Trend: {sanitize_field(tf_data.get('trend', 'N/A'))}\n"
                 f"  Support: {_safe(tf_data.get('support'))} | Resistance: {_safe(tf_data.get('resistance'))}\n"
                 f"  EMA50: {_safe(tf_data.get('ema50'))} | EMA200: {_safe(tf_data.get('ema200'))}\n"
-                f"  RSI: {tf_data.get('rsi', 'N/A')}\n"
+                f"  RSI: {sanitize_field(tf_data.get('rsi', 'N/A'))}\n"
             )
 
         return f"""Market Data for ICT/SMC Analysis
 
-SYMBOL: {data.get('symbol', 'BTCUSDT')}
-CURRENT ANOMALY TRIGGER: You are evaluating a {data.get('anomaly_type', 'UNKNOWN')}
-Fear & Greed: {fg_str}
+SYMBOL: {sanitize_field(data.get('symbol', 'BTCUSDT'))}
+CURRENT ANOMALY TRIGGER: You are evaluating a {sanitize_field(data.get('anomaly_type', 'UNKNOWN'))}
+Fear & Greed: {sanitize_field(fg_str)}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PRICE DATA
@@ -567,12 +688,12 @@ Target Symbol:
   Current Price: {_safe(target.get('close'))}
   4H High: {_safe(target.get('high_4h'))} | 4H Low: {_safe(target.get('low_4h'))}
   EMA50: {_safe(target.get('ema50'))} | EMA200: {_safe(target.get('ema200'))}
-  RSI: {target.get('rsi', 'N/A')}
-  Trend: {target.get('trend', 'N/A')}
+  RSI: {sanitize_field(target.get('rsi', 'N/A'))}
+  Trend: {sanitize_field(target.get('trend', 'N/A'))}
 
 BTC Anchor:
   Current Price: {_safe(btc.get('close'))}
-  Trend: {btc.get('trend', 'N/A')} | RSI: {btc.get('rsi', 'N/A')}
+  Trend: {sanitize_field(btc.get('trend', 'N/A'))} | RSI: {sanitize_field(btc.get('rsi', 'N/A'))}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MULTI-TIMEFRAME STRUCTURE
@@ -582,7 +703,7 @@ MULTI-TIMEFRAME STRUCTURE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 KEY LEVELS (Highs / Lows / FVG Zones)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{levels.get('summary', 'Levels not available.')}
+{sanitize_field(levels.get('summary', 'Levels not available.'))}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 YOUR TASK
@@ -616,12 +737,14 @@ class OrderFlowPersona(BasePersona):
         basis  = data.get("basis", {})
 
         def _pct(v, default="N/A"):
+            # Numeric formatting — no injection risk
             return f"{v:+.4f}%" if isinstance(v, (int, float)) else default
 
+        # P0-FIX (#12): sanitize all text/label fields from market data before injection
         return f"""Market Data for Order Flow / Microstructure Analysis
 
-SYMBOL: {data.get('symbol', 'BTCUSDT')}
-CURRENT ANOMALY TRIGGER: You are evaluating a {data.get('anomaly_type', 'UNKNOWN')}
+SYMBOL: {sanitize_field(data.get('symbol', 'BTCUSDT'))}
+CURRENT ANOMALY TRIGGER: You are evaluating a {sanitize_field(data.get('anomaly_type', 'UNKNOWN'))}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DERIVATIVES MARKET
@@ -630,7 +753,7 @@ Open Interest (OI):
   Binance OI: ${deriv.get('binance_oi_usd', 'N/A')}
   Bybit OI:   ${deriv.get('bybit_oi_usd', 'N/A')}
   OI 24h Change: {_pct(deriv.get('oi_change_pct'))}
-  OI Trend: {deriv.get('oi_trend', 'N/A')}  # rising / falling / neutral
+  OI Trend: {sanitize_field(deriv.get('oi_trend', 'N/A'))}  # rising / falling / neutral
 
 Funding Rates (8h):
   Binance: {_pct(deriv.get('binance_funding'))}
@@ -639,8 +762,8 @@ Funding Rates (8h):
   Avg Funding (composite): {_pct(deriv.get('avg_funding'))}
 
 Long/Short Ratio:
-  Binance: {deriv.get('long_short_ratio_binance', 'N/A')}
-  Bybit:   {deriv.get('long_short_ratio_bybit', 'N/A')}
+  Binance: {sanitize_field(deriv.get('long_short_ratio_binance', 'N/A'))}
+  Bybit:   {sanitize_field(deriv.get('long_short_ratio_bybit', 'N/A'))}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 LIQUIDATION CLUSTERS
@@ -659,9 +782,9 @@ Key Cluster Levels (approx price zones where stops cluster):
 VOLUME DELTA & TAPE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 24h Volume: ${vol.get('volume_24h', 'N/A')}
-Buy Volume %: {vol.get('buy_volume_pct', 'N/A')}%
-Volume vs 7d Avg: {vol.get('volume_vs_avg', 'N/A')}
-Large Trades (> $500K): {vol.get('large_trades_count', 'N/A')}
+Buy Volume %: {sanitize_field(vol.get('buy_volume_pct', 'N/A'))}%
+Volume vs 7d Avg: {sanitize_field(vol.get('volume_vs_avg', 'N/A'))}
+Large Trades (> $500K): {sanitize_field(vol.get('large_trades_count', 'N/A'))}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BASIS / CONTANGO
@@ -703,15 +826,18 @@ class MacroOnChainPersona(BasePersona):
         cycle = data.get("cycle",         {})
 
         def _billions(v, default="N/A"):
+            # Numeric formatting — no injection risk
             return f"${v/1e9:.2f}B" if isinstance(v, (int, float)) else default
 
         def _pct(v, default="N/A"):
+            # Numeric formatting — no injection risk
             return f"{v:+.2f}%" if isinstance(v, (int, float)) else default
 
+        # P0-FIX (#12): sanitize all text/label fields from market data before injection
         return f"""Market Data for Macro / On-Chain Analysis
 
-SYMBOL: {data.get('symbol', 'BTCUSDT')}
-CURRENT ANOMALY TRIGGER: You are evaluating a {data.get('anomaly_type', 'UNKNOWN')}
+SYMBOL: {sanitize_field(data.get('symbol', 'BTCUSDT'))}
+CURRENT ANOMALY TRIGGER: You are evaluating a {sanitize_field(data.get('anomaly_type', 'UNKNOWN'))}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ETF FLOWS (Bitcoin Spot ETFs)
@@ -730,14 +856,14 @@ DXY (US Dollar Index): {macro.get('dxy', 'N/A')}
 10Y US Treasury Yield: {macro.get('us10y_yield', 'N/A')}%
 Fed Balance Sheet (M2): {_billions(macro.get('m2_supply', 0))}
 M2 7-day change:        {_pct(macro.get('m2_change_pct'))}
-Risk Sentiment:        {macro.get('risk_sentiment', 'N/A')}  # risk_on / risk_off / neutral
+Risk Sentiment:        {sanitize_field(macro.get('risk_sentiment', 'N/A'))}  # risk_on / risk_off / neutral
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WHALE & EXCHANGE FLOWS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Exchange BTC Reserves:    {whale.get('exchange_reserves_btc', 'N/A')} BTC
 Exchange Reserves 7d Δ:  {_pct(whale.get('exchange_reserves_change_pct'))}
-Whale Transaction Count: {whale.get('whale_tx_count', 'N/A')}  # >$1M txs
+Whale Transaction Count: {sanitize_field(whale.get('whale_tx_count', 'N/A'))}  # >$1M txs
 Stablecoin (USDT+USDC) on exchanges: {whale.get('stablecoin_exchange_balance', 'N/A')}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -757,7 +883,7 @@ Days Since Halving: {cycle.get('days_since_halving', 'N/A')}
 Post-Halving Year:  {cycle.get('halving_year', 'N/A')}  # Year 1/2/3/4
 Puell Multiple:      {cycle.get('puell_multiple', 'N/A')}
 RHODL Ratio:        {cycle.get('rhodl_ratio', 'N/A')}
-Difficulty Ribbon:  {cycle.get('difficulty_ribbon', 'N/A')}  # compression / expansion / flip
+Difficulty Ribbon:  {sanitize_field(cycle.get('difficulty_ribbon', 'N/A'))}  # compression / expansion / flip
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 YOUR TASK

@@ -56,9 +56,21 @@ def volume_profile_strategy(
     lows = [c["low"] for c in candles]
     volumes = [c["volume"] for c in candles]
 
-    current_price = closes[-1]
-    current_volume = volumes[-1]
-    avg_volume = sum(volumes[-20:]) / 20
+    # Use only closed candles for signal generation to avoid lookahead bias (Issue #14)
+    # closed_candles excludes the current incomplete candle
+    closed_candles = candles[:-1]
+    if len(closed_candles) < 200:
+        return
+
+    closed_closes = [c["close"] for c in closed_candles]
+    closed_highs = [c["high"] for c in closed_candles]
+    closed_lows = [c["low"] for c in closed_candles]
+    closed_volumes = [c["volume"] for c in closed_candles]
+
+    # current_price is the last closed candle's close (not the incomplete current candle)
+    current_price = closed_closes[-1]
+    current_volume = closed_volumes[-1]
+    avg_volume = sum(closed_volumes[-20:]) / 20
 
     # Check if we already have a position
     if symbol in engine.open_trades:
@@ -84,25 +96,49 @@ def volume_profile_strategy(
     stop_loss = None
     take_profit = None
 
+    # FIX #54: Pre-compute all indicators ONCE before iterating LVN/HVN levels.
+    # Previously each candidate level re-ran calculate_ema/rsi/momentum/atr from
+    # scratch — O(n) per level.  Now all four indicators are computed once and
+    # reused, reducing complexity from O(n * num_levels) to O(n) total.
+    _ema20_cache: float = None
+    _ema50_cache: float = None
+    _rsi_cache: float = None
+    _mom_cache: float = None
+    _atr_cache: float = None
+    try:
+        _ema20_cache = indicators.calculate_ema(closed_closes, 20)
+        _ema50_cache = indicators.calculate_ema(closed_closes, 50)
+        _rsi_cache = indicators.calculate_rsi(closed_closes, 14)
+        _mom_raw = indicators.calculate_momentum(closed_closes)
+        _mom_cache = _mom_raw.get("change_24h", 0) if _mom_raw else 0
+        _atr_cache = indicators.calculate_atr(closed_highs, closed_lows, closed_closes, period=14)
+    except Exception:
+        # Indicators unavailable; skip signal generation for this candle
+        pass
+
     # Check for LONG entry at LVN (support)
     for lvn in lvns:
         lvn_price = lvn["price"]
         # Price within 1.5% of LVN
         if abs(current_price - lvn_price) / current_price < 0.015:
             # Bullish confirmation: price above EMA 20, upward momentum
-            try:
-                ema20 = indicators.calculate_ema(closes, 20)
-                ema50 = indicators.calculate_ema(closes, 50)
-                rsi = indicators.calculate_rsi(closes, 14)
-                momentum = indicators.calculate_momentum(closes)
-                mom = momentum.get("change_24h", 0) if momentum else 0
-            except Exception:
-                continue
-
-            if ema20 > ema50 and mom > -1 and rsi < 70 and current_volume > avg_volume * 0.5:
+            if (
+                _ema20_cache is not None
+                and _ema50_cache is not None
+                and _rsi_cache is not None
+                and _mom_cache is not None
+                and _atr_cache is not None
+                and _ema20_cache > _ema50_cache
+                and _mom_cache > -1
+                and _rsi_cache < 70
+                and current_volume > avg_volume * 0.5
+            ):
                 direction = TradeDirection.LONG
-                stop_loss = lvn_price * 0.97  # 3% stop
-                take_profit = current_price + (current_price - stop_loss) * 2  # 2R
+                # Volatility-adjusted stop: stop_distance = ATR_multiplier * ATR
+                atr_multiplier = 2.0  # 2x ATR
+                stop_distance = atr_multiplier * _atr_cache if _atr_cache > 0 else current_price * 0.02
+                stop_loss = current_price - stop_distance
+                take_profit = current_price + stop_distance * 2  # 2R
                 break
 
     # Check for SHORT entry at HVN (resistance) if no long signal
@@ -112,25 +148,32 @@ def volume_profile_strategy(
             # Price within 1.5% of HVN
             if abs(current_price - hvn_price) / current_price < 0.015:
                 # Bearish confirmation: price below EMA 20, downward momentum
-                try:
-                    ema20 = indicators.calculate_ema(closes, 20)
-                    ema50 = indicators.calculate_ema(closes, 50)
-                    rsi = indicators.calculate_rsi(closes, 14)
-                    momentum = indicators.calculate_momentum(closes)
-                    mom = momentum.get("change_24h", 0) if momentum else 0
-                except Exception:
-                    continue
-
-                if ema20 < ema50 and mom < 1 and rsi > 30 and current_volume > avg_volume * 0.5:
+                if (
+                    _ema20_cache is not None
+                    and _ema50_cache is not None
+                    and _rsi_cache is not None
+                    and _mom_cache is not None
+                    and _atr_cache is not None
+                    and _ema20_cache < _ema50_cache
+                    and _mom_cache < 1
+                    and _rsi_cache > 30
+                    and current_volume > avg_volume * 0.5
+                ):
                     direction = TradeDirection.SHORT
-                    stop_loss = hvn_price * 1.03  # 3% stop
-                    take_profit = current_price - (stop_loss - current_price) * 2  # 2R
+                    # Volatility-adjusted stop: stop_distance = ATR_multiplier * ATR
+                    atr_multiplier = 2.0  # 2x ATR
+                    stop_distance = atr_multiplier * _atr_cache if _atr_cache > 0 else current_price * 0.02
+                    stop_loss = current_price + stop_distance
+                    take_profit = current_price - stop_distance * 2  # 2R
                     break
 
     # If signal, open trade
     if direction:
-        # Use 10% of equity per trade, 10x leverage
-        position_size = (engine.equity * 0.10) / current_price
+        # Risk-based position sizing (Issue #16):
+        # position_size = (equity * risk_percent) / stop_distance_pct
+        risk_percent = 0.01  # 1% of equity per trade
+        stop_distance_pct = abs(current_price - stop_loss) / current_price
+        position_size = (engine.equity * risk_percent) / stop_distance_pct
 
         engine.open_trade(
             symbol=symbol,
@@ -142,6 +185,56 @@ def volume_profile_strategy(
             take_profit=take_profit,
             timestamp=current_time,
         )
+
+
+def _simulate_trade_outcome(
+    trade,
+    current_price: float,
+    stop_loss: float,
+    take_profit: float,
+    direction: str
+) -> dict:
+    """
+    Simulate trade outcome with liquidation check (Issue #17).
+
+    Returns a dict with keys:
+        liquidated (bool): True if position was liquidated
+        exit_reason (str): "LIQUIDATION", "STOP_LOSS", "TAKE_PROFIT", or "SIGNAL"
+        exit_price (float): Price at which position was closed
+    """
+    # Calculate liquidation price
+    buffer = 0.001  # 0.1% buffer (conservative)
+    if direction == "LONG":
+        liq_price = trade.entry_price * (1 - 1.0 / trade.leverage - buffer)
+        if current_price <= liq_price:
+            return {
+                "liquidated": True,
+                "exit_reason": "LIQUIDATION",
+                "exit_price": liq_price,
+            }
+    else:  # SHORT
+        # Buffer is SUBTRACTED so liquidation triggers slightly earlier (conservative)
+        liq_price = trade.entry_price * (1 + 1.0 / trade.leverage - buffer)
+        if current_price >= liq_price:
+            return {
+                "liquidated": True,
+                "exit_reason": "LIQUIDATION",
+                "exit_price": liq_price,
+            }
+
+    # No liquidation - determine if stop or take profit hit
+    if direction == "LONG":
+        if stop_loss and current_price <= stop_loss:
+            return {"liquidated": False, "exit_reason": "STOP_LOSS", "exit_price": stop_loss}
+        if take_profit and current_price >= take_profit:
+            return {"liquidated": False, "exit_reason": "TAKE_PROFIT", "exit_price": take_profit}
+    else:  # SHORT
+        if stop_loss and current_price >= stop_loss:
+            return {"liquidated": False, "exit_reason": "STOP_LOSS", "exit_price": stop_loss}
+        if take_profit and current_price <= take_profit:
+            return {"liquidated": False, "exit_reason": "TAKE_PROFIT", "exit_price": take_profit}
+
+    return {"liquidated": False, "exit_reason": "SIGNAL", "exit_price": current_price}
 
 
 def check_exits(engine: BacktestEngine, symbol: str, current_price: float, current_time: datetime):
@@ -233,8 +326,16 @@ def run_backtest(
                 ts
             )
 
+    # Get last close price for each symbol so open positions are closed
+    # at the actual final close price, not the entry price (FIX #2)
+    final_prices = {}
+    for symbol in symbols:
+        candles = backtester.data_cache.get(symbol, {}).get("1h", [])
+        if candles:
+            final_prices[symbol] = candles[-1]["close"]
+
     # Get results
-    result = engine.get_results()
+    result = engine.get_results(final_prices=final_prices)
     output = format_results(result)
 
     return {

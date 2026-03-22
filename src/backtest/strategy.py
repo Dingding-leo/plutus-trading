@@ -1,5 +1,30 @@
 """
 Strategy Executor - Implements the full trading workflow strategy.
+
+CANONICAL STRATEGY - This is the active strategy.
+All other strategy implementations have been archived to backups/strategies_archive/
+and are deprecated. Do not create new strategy files in this directory;
+modify this file instead.
+
+Active strategy classes:
+  - WorkflowStrategy (this module) - core technical entry/exit logic
+
+Active strategy wrappers:
+  - HybridWorkflowStrategy (hybrid_strategy.py) - wraps WorkflowStrategy + LLM Execution Gate
+
+Archived strategies (backups/strategies_archive/):
+  - aggressive_strategy.py     - aggressive signal-based strategy
+  - complete_strategy.py       - complete workflow implementation
+  - complete_trading_system.py - full trading system
+  - ema_strategy.py            - EMA crossover strategy
+  - improved_strategy.py       - improved entry logic
+  - llm_strategy.py            - LLM-powered strategy
+  - optimized_strategy.py      - optimized parameters
+  - production_strategy.py      - production-ready strategy
+  - simple_strategy.py          - simplified strategy
+  - time_based.py              - time-iterated backtester
+  - workflow_strategy.py        - duplicate WorkflowStrategy (DEPRECATED - name conflict)
+  - optimize_aggressive.py      - optimization harness for aggressive strategy
 """
 
 from datetime import datetime

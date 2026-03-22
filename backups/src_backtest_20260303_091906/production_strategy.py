@@ -9,7 +9,6 @@ from .engine import BacktestEngine, TradeDirection
 from ..analysis import indicators
 from ..execution import position_sizer
 from ..data import coin_tiers
-from ..data.coin_tiers import normalize_symbol, is_major
 
 
 class ProductionStrategy:
@@ -35,17 +34,14 @@ class ProductionStrategy:
         try:
             ema20 = indicators.calculate_ema(closes, 20)
             ema50 = indicators.calculate_ema(closes, 50)
-            ema200 = indicators.calculate_ema(closes, 200) if len(closes) >= 200 else None
             rsi = indicators.calculate_rsi(closes, 14)
-        except Exception:
+        except:
             return None
 
-        # Trend based on EMA50 vs EMA200 (workflow standard)
-        if ema200 is None:
-            trend = "SIDEWAYS"
-        elif ema50 > ema200:
+        # Trend
+        if ema20 > ema50:
             trend = "UPTREND"
-        elif ema50 < ema200:
+        elif ema20 < ema50:
             trend = "DOWNTREND"
         else:
             trend = "SIDEWAYS"
@@ -80,7 +76,6 @@ class ProductionStrategy:
             "rsi": rsi,
             "ema20": ema20,
             "ema50": ema50,
-            "ema200": ema200,
             "support": sr["low"],
             "resistance": sr["high"],
             "position_in_range": sr["position_in_range"],
@@ -98,7 +93,7 @@ class ProductionStrategy:
             return
 
         # Track BTC
-        if symbol == "BTCUSDT":
+        if symbol == "BTC-USDT":
             self.btc_trend = analysis["trend"]
 
         current = analysis["current"]
@@ -131,8 +126,8 @@ class ProductionStrategy:
             return
 
         # No alt longs when BTC down
-        symbol_base = normalize_symbol(symbol)
-        if not is_major(symbol_base) and self.btc_trend == "DOWNTREND" and direction == TradeDirection.LONG:
+        symbol_base = symbol.replace("-USDT", "USDT")
+        if symbol_base != "BTCUSDT" and self.btc_trend == "DOWNTREND" and direction == TradeDirection.LONG:
             return
 
         # Stops
@@ -216,6 +211,6 @@ def run_production_backtest(symbols=None, start_date='2025-09-01', end_date='202
         current_time = data[valid[0]][i]['datetime']
 
         for sym in valid:
-            strategy.execute(engine, sym, {'1h': data[sym][:i+1]}, current_time, ts)
+            strategy.execute(engine, sym.replace('USDT', '-USDT'), {'1h': data[sym][:i+1]}, current_time, ts)
 
     return format_results(engine.get_results())

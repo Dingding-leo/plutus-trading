@@ -1,23 +1,23 @@
-# Plutus Trading System - Developer Guide
+# Plutus Trading System — Developer Guide
 
-> Last Updated: 2026-03-03
+> Last Updated: 2026-03-22 (V4.2)
+
+---
 
 ## Quick Start
 
-### CLI Usage
-
 ```bash
 # Run a backtest
-python -m src.cli backtest --symbols BTC-USDT,ETH-USDT --start 2025-01-01 --end 2025-03-01 --equity 10000
+python -m src.cli backtest --symbols BTCUSDT,ETHUSDT --start 2022-01-01 --end 2024-12-31 --equity 10000
 
 # Run market analysis
 python -m src.cli analyze --save
 
 # Run intraday scanner
-python -m src.cli scan --symbols BTC-USDT
+python -m src.cli scan --symbols BTCUSDT,ETHUSDT,SOLUSDT
 
 # Generate trade plan
-python -m src.cli trade --symbol BTC-USDT --direction LONG --entry 50000 --stop 49500 --target 52000
+python -m src.cli trade --symbol BTCUSDT --direction BUY --risk-level MODERATE --equity 10000
 
 # Log feedback
 python -m src.cli feedback
@@ -25,41 +25,26 @@ python -m src.cli feedback
 # Get help
 python -m src.cli --help
 python -m src.cli backtest --help
-```
 
-### Python Usage
-
-```python
-# Run a backtest
-from src.backtest.strategy import run_backtest, StrategyConfig
-
-config = StrategyConfig(
-    base_risk_pct=0.01,  # 1% risk per trade
-    pos_mult=1.0,
-    max_leverage=50.0,
-    min_rr=1.5,
-)
-
-result = run_backtest(
-    symbols=["BTC-USDT", "ETH-USDT"],
-    start_date="2025-01-01",
-    end_date="2025-03-01",
-    initial_equity=10000,
-    config=config
-)
-print(result["output"])
+# Run Docker (live trading)
+cd docker && docker compose up -d
 ```
 
 ---
 
 ## System Overview
 
-Plutus is a crypto futures trading system that:
-- Trades 45+ coins across OKX leverage tiers (100x, 50x, 20x)
-- Uses multi-timeframe analysis (5m, 15m, 30m, 1h, 4h)
-- Applies EMA/RSI for trend and momentum
-- Uses Volume Profile for key level identification
-- Implements risk-based position sizing with CLAUDE.md rules
+Plutus V4 is a crypto futures trading system with two operational modes:
+
+1. **Chronos Backtest** — Event-driven historical simulation using VanguardScanner (vectorised NumPy/Pandas), 3 LLM personas, MoEWeighter, DynamicAllocator, GeneticOptimizer, and SQLite MemoryBank RAG.
+2. **Live Trading** — Wired 6-connection pipeline: Binance WebSocket → Redis Stream → IdempotentScannerWorker → LiveExecutionNode → SmartRouter → BinanceExecutor → RiskGuard.
+
+Key capabilities:
+- Trades 45+ coins (Binance Futures)
+- Multi-timeframe analysis (5m, 15m, 30m, 1h, 4h)
+- LLM-augmented decision making with self-healing memory
+- Institutional-grade risk management (9 sequential RiskGuard checks)
+- Docker-based deployment with TimescaleDB + Redis
 
 ---
 
@@ -67,34 +52,78 @@ Plutus is a crypto futures trading system that:
 
 ```
 src/
-├── cli.py                 # CLI entry point
-├── config.py              # Global configuration
-├── data/                  # Data fetching
-│   ├── binance_client.py  # Binance API
-│   ├── okx_client.py     # OKX API
-│   ├── coingecko_client.py # CoinGecko API
-│   ├── news_fetcher.py   # News checking
-│   ├── coin_tiers.py     # Tier parameters ← EDIT THIS
-│   ├── futures.py        # Tradable futures list
-│   ├── workflow_analyzer.py # Market analysis
-│   └── llm_client.py     # LLM integration
-├── analysis/              # Technical analysis
-│   ├── indicators.py     # EMA, RSI, ATR, S/R
-│   ├── volume_profile.py # LVN/HVN calculations
-│   └── market_context.py # Risk classification
-├── execution/             # Trade execution
-│   ├── position_sizer.py # Risk-based sizing
-│   ├── decision_engine.py # Trade decisions
-│   └── trade_plan.py     # Trade validation
-├── backtest/             # Backtesting
-│   ├── engine.py         # Core backtest engine
-│   ├── strategy.py       # Main strategy logic
-│   ├── production_strategy.py # Production-ready strategy
-│   ├── optimized_strategy.py # Optimized strategy
-│   └── *.py              # Other strategies
-└── storage/              # Data persistence
-    ├── daily_logger.py   # Daily analysis logs
-    └── feedback_logger.py # Feedback logs
+├── cli/                     # CLI refactored into command modules
+│   ├── commands/
+│   │   ├── analyze.py       # Market analysis
+│   │   ├── backtest.py      # ChronosBacktester
+│   │   ├── feedback.py      # Lesson logging
+│   │   ├── scan.py         # VanguardScanner
+│   │   └── trade.py        # Trade plan + validation
+│   ├── main.py              # Entry point
+│   └── utils.py             # Shared utilities
+│
+├── config.py                 # Global constants (PROJECT_ROOT, LEVERAGE_BUFFERS, RISK_MULTIPLIERS)
+│
+├── data/
+│   ├── binance_client.py   # Binance OHLCV + local CSV data lake
+│   ├── coingecko_client.py  # Global market metrics
+│   ├── coin_tiers.py       # Tier system + symbol normalisation
+│   ├── llm_client.py       # LLM client (lazy-loaded via LazyLLMClientProxy)
+│   ├── memory.py            # SQLite MemoryBank RAG (~/.plutus/memory.db)
+│   ├── personas.py          # 3 LLM personas + reflexion
+│   ├── scanner.py           # VanguardScanner — vectorised NumPy/Pandas anomaly detector
+│   └── streams/             # Real-time data sources
+│       ├── binance_websocket.py  # Binance WebSocket → XADD pipeline
+│       └── glassnode.py          # Glassnode on-chain metrics
+│
+├── analysis/
+│   ├── indicators.py       # EMA, RSI, ATR, SMA, momentum, volatility
+│   ├── volume_profile.py   # LVN/HVN, multi-TF resonance
+│   └── market_context.py  # Risk classification, macro state
+│
+├── models/                  # Meta-learning + parameter evolution
+│   ├── meta_learning.py   # MoEWeighter, GeneticOptimizer, ReflexionEvolver,
+│   │                       DynamicAllocator, CorrelationEngine
+│   └── params.py          # Single source of truth for GA-evolvable parameters
+│
+├── execution/              # Order execution + risk management
+│   ├── __main__.py       # LiveExecutionNode (live trading service)
+│   ├── exchanges/
+│   │   └── binance_executor.py  # Binance Futures execution
+│   ├── order_router.py   # SmartRouter: TWAP / VWAP / LimitQueue
+│   ├── portfolio_matrix.py # SpreadTrader, RiskManager, CorrelationEngine
+│   ├── position_sizer.py # Gate A/B, calculate_max_leverage
+│   ├── risk_limits.py    # RiskGuard (9 sequential checks)
+│   ├── trade_plan.py    # Standardised trade output + validation
+│   └── risk/            # Risk utilities
+│
+├── engine/                # Live infrastructure
+│   ├── __main__.py       # Docker entry point for plutus_engine
+│   ├── server.py         # FastAPI + Redis pub/sub (plutus_engine)
+│   ├── scanner_cli.py     # BinanceConnector → XADD Redis stream producer
+│   ├── scanner_worker.py  # IdempotentScannerWorker (asyncio.create_task in server.py)
+│   └── realtime_pipeline.py # XADD → XREADGROUP pipeline
+│
+├── backtest/               # Historical simulation
+│   ├── chronos/          # Chronos sub-modules
+│   ├── chronos_engine.py # ChronosBacktester (orchestrator)
+│   ├── engine.py         # BacktestEngine (V1/V2)
+│   ├── strategy.py        # WorkflowStrategy
+│   └── simple_fetch.py    # Historical data fetcher
+│
+└── dashboard/
+    ├── app.py            # Streamlit forensics dashboard
+    └── data_loader.py    # Dashboard data loader
+
+docker/
+├── docker-compose.yml     # 5-service topology: plutus_engine, execution_node,
+│                          #   scanner, timescaledb, redis
+├── plutus_engine.Dockerfile
+├── execution_node.Dockerfile
+├── scanner.Dockerfile
+├── Dockerfile.quant_worker
+├── init-scripts/001_init.sql  # TimescaleDB schema
+└── nginx.conf
 ```
 
 ---
@@ -105,86 +134,96 @@ src/
 
 ```bash
 python -m src.cli backtest \
-    --symbols BTC-USDT,ETH-USDT,SOL-USDT \
-    --start 2025-01-01 \
-    --end 2025-03-01 \
+    --symbols BTCUSDT,ETHUSDT \
+    --start 2022-01-01 --end 2024-12-31 \
     --equity 10000 \
-    --risk 1.0 \
-    --leverage 50 \
-    --pos-mult 1.0 \
-    --min-rr 1.5
+    --v3-chronos --v3-mode dry_run
 ```
 
 Options:
-- `--symbols`: Comma-separated symbols (default: BTC-USDT,ETH-USDT,SOL-USDT)
-- `--start`: Start date (YYYY-MM-DD)
-- `--end`: End date (YYYY-MM-DD)
+- `--symbols`: Comma-separated symbols (default: BTCUSDT)
+- `--start` / `--end`: Date range (YYYY-MM-DD)
 - `--equity`: Initial equity (default: 10000)
-- `--risk`: Risk per trade % (default: 1.0)
-- `--leverage`: Max leverage (default: 50)
-- `--pos-mult`: Position multiplier (default: 1.0)
-- `--min-rr`: Minimum risk/reward ratio (default: 1.5)
+- `--v3-chronos`: Enable Chronos V3 engine
+- `--v3-mode`: `dry_run` (mock personas, no API cost) or `live` (real LLM calls)
+- `--v3-min-confidence`: Minimum blended confidence to execute (0-100)
 
 ### analyze
 
 ```bash
-python -m src.cli analyze --save
+python -m src.cli analyze --market futures --save
 ```
 
-Runs full market analysis and optionally saves to daily log.
+Runs full market context analysis and optionally saves to daily log.
 
 ### scan
 
 ```bash
-python -m src.cli scan --symbols BTC-USDT,ETH-USDT
+python -m src.cli scan --symbols BTCUSDT,ETHUSDT,SOLUSDT --market futures
 ```
 
-Runs intraday scanner across multiple timeframes.
+Vectorised scanner across multiple timeframes. Outputs anomaly events only (99%+ of candles filtered as noise).
 
 ### trade
 
 ```bash
-python -m src.cli trade \
-    --symbol BTC-USDT \
-    --direction LONG \
-    --entry 50000 \
-    --stop 49500 \
-    --target 52000
+python -m src.cli trade --symbol BTCUSDT --direction BUY --risk-level MODERATE --equity 10000
 ```
 
-Generates and validates a trade plan.
+Generates and validates a trade plan. RiskGuard gates applied.
 
 ### feedback
 
 ```bash
-python -m src.cli feedback
+python -m src.cli feedback --date 2026-03-22
 ```
 
-Logs feedback for learning.
+Logs feedback for MemoryBank RAG.
 
 ---
 
-## Trading Rules (CLAUDE.md)
-
-The system implements these rules from TRADING_WORKFLOW.md:
+## Trading Rules (from CLAUDE.md)
 
 ### Position Sizing
 
 ```
-base_risk_$ = equity × 1%
+base_risk_$  = equity × 1%
 effective_risk_$ = base_risk_$ × pos_mult
 max_position_value = effective_risk_$ / stop_distance%
 ```
 
-**Risk Environment Multipliers:**
-- LOW: 1.0x-1.2x (no major news + normal volatility)
-- MODERATE: 0.7x-1.0x (general news OR elevated volatility)
-- HIGH: 0.3x-0.5x (CPI/FOMC/war/regulation OR ATR ≥ 1.5x)
+**Gate A (Small Stop Penalty):**
+```
+if stop_distance% < 0.5% AND risk_env == HIGH:
+    pos_mult = min(pos_mult, 0.3)
+```
 
-**HIGH RISK Triggers:**
-- Major macro (CPI/FOMC/NFP/war escalation/SEC regulation)
-- 15m ATR ≥ 20-bar average × 1.5
-- 30m structure just broke
+**Gate B (Position Cap):**
+```
+max_position_value ≤ equity × 0.7 (training) or equity × 1.0 (advanced)
+```
+
+### Risk Environment → Position Multiplier
+
+| Level | Trigger | pos_mult |
+|-------|---------|-----------|
+| LOW | No news + normal volatility + clear structure | 1.0x–1.2x |
+| MODERATE | General news OR elevated volatility | 0.7x–1.0x |
+| HIGH | CPI/FOMC/war/regulation OR ATR ≥ 1.5x OR structure broken | 0.3x–0.5x |
+
+### RiskGuard — 9 Sequential Checks
+
+```
+[0] kill_switch          — permanent halt after session loss
+[1] global_drawdown      — halt when equity < 92% of peak
+[2] fat_finger_notional  — max notional per symbol ($5k live, $10k dry)
+[3] correlated_exposure   — crypto beta > 50% when BTC downtrend
+[4] leverage_circuit    — max leverage by risk level (5x-15x)
+[5] session_loss         — hard stop at -5% session loss
+[6] liquidation_buffer   — 0.5% major / 1.5% small cap buffer
+[7] absolute_equity_floor — permanent halt below $1,000 equity
+[8] black_swan          — flatten on -5% intraday drawdown
+```
 
 ### Asset Selection
 
@@ -192,362 +231,211 @@ max_position_value = effective_risk_$ / stop_distance%
 BTC > ETH > ALT
 ```
 
-- If BTC shows strength → trade BTC
-- If risk_off + BTC weakness → NO TRADE or BTC SHORT only
-- ALT longs forbidden in risk_off environments
+If BTC shows strength → trade BTC. If macro == risk_off and BTC weakness → NO TRADE or BTC SHORT. ALT LONG forbidden in risk_off.
 
-### Decision Framework
+### Execution Gate (DecisionEngine)
 
 ```
 PHASE 1: No trigger → NO TRADE
 PHASE 2: Trigger but no confirmation → WAIT
-PHASE 3: Trigger + confirmation → CHECK GATE → EXECUTE
+PHASE 3: Trigger + confirmation → CHECK EXECUTION GATE → EXECUTE or SKIP
 ```
 
-**Execution Gate:**
-- structure_break = True
-- macro_aligned = True
-- invalidation_clear = True
-- RR ≥ 1.5 (including fees)
+Gate conditions: structure_break AND macro_aligned AND invalidation_clear AND RR >= 1.5 (including extension).
 
 ### Stop Loss Rules
 
-- Stop must be ≥ 0.5% OR use stricter pos_mult (≤ 0.3)
 - Major coins: liquidation buffer = 0.5%
 - Small caps: liquidation buffer = 1.5%
+- Stop must be ≥ 0.5% OR pos_mult capped at 0.3
+- Gate A penalty threshold = 0.5%
 - Open in tranches: 50% / 30% / 20%
-
----
-
-## How to Modify
-
-### 1. Change Trading Parameters
-
-Edit `src/data/coin_tiers.py`:
-
-```python
-TIER_PARAMS = {
-    "TIER_1": {
-        "max_leverage": 100,    # OKX: 100x for BTC/ETH
-        "risk_pct": 0.022,      # Risk % per trade
-        "stop_pct": 0.008,      # Stop loss %
-        "target_mult": 8.5,      # Target = stop * target_mult
-    },
-    # ... TIER_2 (50x), TIER_3 (20x)
-}
-```
-
-### 2. Change Risk Rules
-
-Edit `src/execution/position_sizer.py`:
-
-```python
-def get_position_multiplier(risk_level: str) -> float:
-    if risk_level == "LOW":
-        return 1.0   # 1.0x - 1.2x
-    elif risk_level == "MODERATE":
-        return 0.85  # 0.7x - 1.0x
-    elif risk_level == "HIGH":
-        return 0.4   # 0.3x - 0.5x
-```
-
-### 3. Change Entry Logic
-
-Edit `src/backtest/strategy.py`:
-
-```python
-def check_entry(self, symbol, analysis, equity):
-    # Entry criteria here
-    if quality < self.quality_threshold:
-        return None
-
-    # RR check
-    rr = abs(target - entry) / abs(entry - stop)
-    if rr < self.min_rr:
-        return None
-```
-
-### 4. Change Trading Fees
-
-Edit `src/backtest/engine.py`:
-
-```python
-def __init__(
-    self,
-    initial_equity: float = 10000,
-    maker_fee: float = 0.0002,  # 0.02%
-    taker_fee: float = 0.0005,  # 0.05%
-    slippage: float = 0.0005,    # 0.05%
-):
-```
 
 ---
 
 ## Key Classes
 
-### BacktestEngine
+### ChronosBacktester
 
 ```python
-from src.backtest.engine import BacktestEngine
+from src.backtest.chronos_engine import ChronosBacktester
 
-engine = BacktestEngine(initial_equity=10000)
+engine = ChronosBacktester(
+    initial_equity=10000,
+    mode=BacktestMode.DRY_RUN,
+)
+results = engine.run_backtest(symbols=["BTCUSDT", "ETHUSDT"])
+```
 
-# Open trade
-engine.open_trade(
-    symbol="BTC-USDT",
-    direction=TradeDirection.LONG,
-    entry_price=50000,
-    size=0.1,
-    leverage=10,
+Returns: equity curve, trade log, forensics metrics, session summary.
+
+### VanguardScanner
+
+```python
+from src.data.scanner import VanguardScanner, ScannerConfig
+
+scanner = VanguardScanner()
+events = scanner.scan(df)  # df: OHLCV DataFrame
+# Returns list of ScannerEvent with anomaly_type, confidence, context_data
+```
+
+### RiskGuard
+
+```python
+from src.execution.risk_limits import RiskGuard
+
+guard = RiskGuard(initial_capital=10000, mode="dry_run")
+passed, msg = guard.check_all(
+    proposed_symbol="BTCUSDT",
+    proposed_notional=5000,
+    proposed_leverage=10,
+    btc_trend="UPTREND",
+)
+```
+
+### BinanceExecutor
+
+```python
+from src.execution.exchanges.binance_executor import BinanceExecutor
+
+exec = BinanceExecutor(test_mode=False)  # live mode = real Binance API
+exec.record_fill(order_id, symbol, side, quantity, fill_price)
+position = exec.get_position("BTCUSDT")
+```
+
+### LiveExecutionNode
+
+```python
+# Entry point: python -m src.execution
+# Wires: scanner → decision → risk → execution → fill tracking
+```
+
+### SmartRouter
+
+```python
+from src.execution.order_router import SmartRouter
+
+router = SmartRouter(binance_exec=BinanceExecutor())
+result = router.route(
+    intent={"aggressive_fill": 1.0},
+    symbol="BTCUSDT",
+    side="BUY",
+    notional=5000,
     stop_loss=49000,
     take_profit=52000,
-    timestamp=datetime.now()
-)
-
-# Check exits
-engine.check_stop_take("BTC-USDT", current_price, timestamp)
-
-# Close trade
-engine.close_trade("BTC-USDT", current_price, timestamp, "REASON")
-
-# Get results (pass final prices for open trades)
-results = engine.get_results(final_prices={"BTC-USDT": 51000})
-```
-
-### StrategyConfig
-
-```python
-from src.backtest.strategy import StrategyConfig
-
-config = StrategyConfig(
-    base_risk_pct=0.01,     # 1% risk per trade
-    pos_mult=1.0,            # Position multiplier
-    max_leverage=50.0,       # Max leverage
-    training_mode=True,      # Training mode
-    min_rr=1.5,             # Minimum RR
-    min_resonance=2,         # Min timeframes for level alignment
-    min_volume_profile_confidence=0.6,
 )
 ```
 
 ---
 
-## Technical Indicators
-
-### EMA
+## Genetic Algorithm — params.py
 
 ```python
-from src.analysis import calculate_ema
+from src.models.params import GAConfig, GAIndividual
 
-ema20 = calculate_ema(closes, 20)
-ema50 = calculate_ema(closes, 50)
-ema200 = calculate_ema(closes, 200)
-```
+GAConfig bounds:
+  sweep_threshold:        [0.0001, 0.05]
+  vol_squeeze_atr_mult:   [0.05, 3.0]
+  deviation_z_score:         [0.5, 5.0]
+  min_confidence_threshold:  [1, 100]
+  max_positions:            [1, 5]
 
-### RSI
-
-```python
-from src.analysis import calculate_rsi
-
-rsi = calculate_rsi(closes, 14)  # 14-period RSI
-```
-
-### Volume Profile
-
-```python
-from src.analysis import calculate_volume_profile, find_lvn, find_hvn
-
-# With high-low distribution (recommended)
-profile = calculate_volume_profile(closes, volumes, highs, lows, bins=50)
-lvns = find_lvn(profile, threshold_percentile=20, num_nodes=3)
-hvns = find_hvn(profile, threshold_percentile=80, num_nodes=3)
-```
-
-### Market Context
-
-```python
-from src.analysis import classify_risk_level, determine_macro_state
-
-# Classify risk level
-risk = classify_risk_level(
-    has_war_news=False,
-    has_macro_news=True,
-    atr_multiplier=1.2,
-    structure_broken=False,
-    fear_greed_index=35
-)
-# Returns: "LOW", "MODERATE", or "HIGH"
-
-# Determine macro state
-macro = determine_macro_state(btc_analysis)
-# Returns: "risk_on" or "risk_off"
+GA fitness: Sharpe * (1 - max_drawdown_weight)
+Hard constraints: sweep_threshold >= 0.005 (0.5%)
 ```
 
 ---
 
-## Position Sizing
+## Docker Services
 
-```python
-from src.execution import (
-    get_position_multiplier,
-    calculate_max_leverage,
-    calculate_position_size,
-    calculate_rr,
-)
+```bash
+cd docker
+docker compose up -d
 
-# Get position multiplier based on risk level
-pos_mult = get_position_multiplier("MODERATE")  # Returns 0.85
-
-# Calculate max leverage
-max_lev = calculate_max_leverage(
-    stop_distance=0.02,  # 2%
-    coin_type="major"    # "major" or "small"
-)
-
-# Calculate position size
-position = calculate_position_size(
-    equity=10000,
-    risk_pct=0.01,
-    stop_distance=0.02,
-    pos_mult=1.0,
-    coin_type="major",
-    training_mode=True
-)
-
-# Calculate RR with fees
-rr = calculate_rr(entry=50000, stop=49500, target=51500, fees_pct=0.1)
-# Returns: {risk, reward, rr_gross, rr_net, fees_pct}
+# Services:
+#   plutus_engine :8000  FastAPI + IdempotentScannerWorker
+#   execution_node          LiveExecutionNode
+#   scanner                 BinanceConnector → XADD Redis
+#   timescaledb :5432       Hypertables for OHLCV, fills, scanner events
+#   redis :6379             Pub/sub + orderbook stream (MAXLEN 50k, noeviction)
 ```
 
 ---
 
-## Trade Plan
+## Requirements
 
-```python
-from src.execution import create_trade_plan, validate_trade_plan
+```
+# Core
+requests>=2.28.0
+pandas>=2.0.0
+numpy>=1.26.0
 
-# Create trade plan
-plan = create_trade_plan(
-    symbol="BTC-USDT",
-    direction="LONG",
-    entry=50000,
-    stop=49500,
-    target=52000,
-    equity=10000,
-    risk_pct=1.0,
-    coin_type="major"
-)
+# Async I/O
+aiohttp>=3.9.0
+redis>=5.0.0
+asyncpg>=0.29.0
 
-# Validate
-validation = validate_trade_plan(plan)
-# Returns: {valid, errors, warnings}
+# LLM
+openai>=1.0.0    # or anthropic>=0.20.0
+
+# Infra
+fastapi>=0.110.0
+uvicorn>=0.27.0
+streamlit>=1.30.0
+
+# ML
+scikit-learn>=1.4.0   # ReflexionEvolver TF-IDF
+ta>=0.11.0            # Technical indicators
+python-dotenv>=1.0.0
+
+pip install -r requirements.txt
 ```
 
 ---
 
-## OKX Leverage Tiers
+## Data Sources
 
-| Tier | Max Leverage | Coins |
-|------|--------------|-------|
-| TIER_1 | 100x | BTC, ETH |
-| TIER_2 | 50x | BNB, SOL, XRP, ADA, DOGE, AVAX, DOT, LINK, UNI, ATOM, etc. |
-| TIER_3 | 20x | All others |
-
----
-
-## LLM Integration
-
-```python
-from src.data import analyze_market
-
-result = analyze_market(
-    btc_data={'current_price': 65000, 'trend': 'UPTREND', 'rsi': 45},
-    eth_data={'current_price': 3500, 'trend': 'UPTREND'},
-    market_overview={'fear_greed_index': 55}
-)
-# Returns: {'decision': 'BUY', 'symbol': 'BTC', 'risk_level': 'MODERATE'}
-```
-
-API settings in `src/data/llm_client.py`:
-- Base URL: `https://api.minimaxi.com/v1`
-- Model: `MiniMax-M2.5`
-
----
-
-## News Checking
-
-```python
-from src.data import NewsChecker
-
-checker = NewsChecker()
-result = checker.check_for_major_events()
-# Returns: {has_critical_news, has_war_news, has_macro_news, risk_level}
-
-# Manual override via environment variables:
-# PLUTUS_HAS_CRITICAL_NEWS=true
-# PLUTUS_HAS_WAR_NEWS=true
-# PLUTUS_HAS_MACRO_NEWS=true
-```
-
----
-
-## Data Fetching
-
-### Binance
-
-```python
-from src.data import fetch_klines, get_price_data, get_current_price
-
-# Fetch klines
-candles = fetch_klines("BTCUSDT", "1h", limit=200)
-
-# Get multiple timeframes
-data = get_price_data("BTCUSDT", ["1h", "4h", "1d"])
-
-# Get current price
-price = get_current_price("BTCUSDT")
-```
-
-### OKX
-
-```python
-from src.data import OKXClient
-
-client = OKXClient()
-candles = client.fetch_ohlcv("BTC-USDT", "1h", start_time="2025-01-01")
-```
-
-### CoinGecko
-
-```python
-from src.data import get_global_data, get_market_overview
-
-data = get_global_data()
-overview = get_market_overview()
-```
+| Source | Use |
+|--------|-----|
+| Binance fapi v1 | Futures OHLCV (primary, max 1500 candles/request) |
+| Binance spot v3 | Spot OHLCV (fallback) |
+| CoinGecko | Global market cap, fear & greed |
+| Glassnode | On-chain metrics (OI, whale wallets, MVRV) |
+| LLM Provider (Minimax/OpenAI) | Persona analysis, reflexion |
+| TimescaleDB | OHLCV, fills, scanner events, portfolio snapshots |
+| Redis | Real-time orderbook stream, pub/sub signals |
+| SQLite (~/.plutus/memory.db) | Lesson persistence (MemoryBank RAG) |
 
 ---
 
 ## Common Issues
 
 ### 1. No trades generated
-- Check quality_threshold is not too high
-- Ensure data is fetching correctly
-- Verify symbols exist on Binance
+- Check `--v3-min-confidence` threshold (try lowering to 30)
+- Verify Binance API credentials are set
+- Ensure `--v3-mode` is correct (`dry_run` vs `live`)
 
 ### 2. High drawdown
-- Reduce risk_pct in TIER_PARAMS
-- Increase stop_pct for wider stops
-- Lower target_mult for lower RR
+- Reduce `--v3-equity` (try 5000)
+- Increase `--v3-min-confidence`
+- Run with `--risk-level MODERATE` instead of `LOW`
 
-### 3. Low win rate
-- Increase quality_threshold
-- Increase RR minimum
-- Tighten BTC trend filter
+### 3. LLM not called in backtest
+- `--v3-mode` must be `live` to call the LLM API. `dry_run` uses deterministic mock personas.
+- Check `LLM_API_KEY` and `LLM_BASE_URL` are set in `.env`
 
 ### 4. Import errors
-- Make sure to activate virtual environment: `source .venv/bin/activate`
-- Check all __init__.py files export correctly
+- Ensure virtual environment is activated: `source .venv/bin/activate`
+- `pip install -r requirements.txt` has been run
+
+### 5. Docker won't start
+- `docker compose config` to validate compose file
+- `docker compose logs plutus_engine` to see startup errors
+- Check `.env` has all required variables set
+
+### 6. TimescaleDB schema not created
+- `docker compose logs timescaledb` — check if init scripts ran
+- Verify `docker/init-scripts/001_init.sql` exists
 
 ---
 
@@ -555,47 +443,51 @@ overview = get_market_overview()
 
 | File | Purpose |
 |------|---------|
-| `cli.py` | CLI entry point |
-| `config.py` | Global configuration |
-| `coin_tiers.py` | Tier parameters (risk, leverage, stops) |
-| `engine.py` | Trade execution, P&L calculation |
-| `strategy.py` | Main strategy logic |
-| `indicators.py` | EMA, RSI, ATR, S/R calculations |
-| `volume_profile.py` | LVN/HVN calculations |
-| `market_context.py` | Risk classification |
-| `position_sizer.py` | Risk-based position sizing |
-| `decision_engine.py` | Trade decision logic |
-| `trade_plan.py` | Trade validation |
-| `llm_client.py` | LLM API integration |
-| `binance_client.py` | Binance data fetching |
-| `okx_client.py` | OKX data fetching |
-| `daily_logger.py` | Daily analysis logging |
-| `feedback_logger.py` | Feedback logging |
+| `src/cli/main.py` | CLI entry point |
+| `src/cli/commands/backtest.py` | ChronosBacktester invocation |
+| `src/config.py` | Global constants (PROJECT_ROOT, LEVERAGE_BUFFERS, RISK_MULTIPLIERS, SMALL_STOP_THRESHOLD) |
+| `src/data/scanner.py` | VanguardScanner — vectorised anomaly detector |
+| `src/data/memory.py` | SQLite MemoryBank (~/.plutus/memory.db) |
+| `src/data/personas.py` | 3 LLM personas + reflexion |
+| `src/data/binance_client.py` | Binance OHLCV + local CSV lake |
+| `src/execution/risk_limits.py` | RiskGuard (9 checks) |
+| `src/execution/position_sizer.py` | Gate A/B, calculate_max_leverage |
+| `src/execution/order_router.py` | SmartRouter: TWAP/VWAP/LimitQueue |
+| `src/execution/exchanges/binance_executor.py` | Binance Futures execution |
+| `src/models/params.py` | GA-evolvable parameter bounds |
+| `src/backtest/chronos_engine.py` | ChronosBacktester orchestrator |
+| `src/engine/server.py` | FastAPI + IdempotentScannerWorker |
+| `src/engine/scanner_worker.py` | IdempotentScannerWorker consumer |
+| `src/engine/realtime_pipeline.py` | XADD → XREADGROUP pipeline |
+| `src/dashboard/app.py` | Streamlit forensics dashboard |
+| `docker/init-scripts/001_init.sql` | TimescaleDB schema |
 
 ---
 
-## Testing
+## Architecture: Live Pipeline (Connections)
 
-```python
-# Quick test
-from src.backtest.strategy import run_backtest, StrategyConfig
-
-config = StrategyConfig()
-result = run_backtest(
-    symbols=["BTC-USDT"],
-    start_date="2025-01-01",
-    end_date="2025-02-01",
-    initial_equity=10000,
-    config=config
-)
-print(result["output"])
 ```
-
----
-
-## Contact
-
-For issues or questions, refer to:
-- `TRADING_WORKFLOW.md` - Original trading rules from CLAUDE.md
-- `CLAUDE.md` - Detailed trading rules
-- Source code comments in each module
+Binance WebSocket → BinanceConnector._on_message()
+     ↓ XADD
+Redis Stream (plutus:scanner:stream)
+     ↓ XREADGROUP
+IdempotentScannerWorker.run()
+     ↓ PUBLISH
+Redis Pub/Sub (scanner.events)
+     ↓
+LiveExecutionNode._on_anomaly()
+     ↓
+HybridWorkflowStrategy.analyze_symbol()
+     ↓
+DecisionEngine.check_execution_gate()
+     ↓
+RiskGuard.check_all()  ← 9 sequential checks
+     ↓
+SmartRouter.route()
+     ↓
+BinanceExecutor.place_order()
+     ↓
+RiskGuard.update_position_from_fill()
+     ↓
+TimescaleDB write (OHLCV, fills, portfolio snapshots)
+```

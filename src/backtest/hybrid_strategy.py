@@ -10,9 +10,21 @@ Architecture:
   - WorkflowStrategy: generates technical setups (unchanged)
   - HybridWorkflowStrategy: wraps WorkflowStrategy + LLM Execution Gate
   - get_llm_macro_context(): calls LLM, returns macro context dict
+
+Three-Phase Decision Framework (CLAUDE.md Section 11):
+  PHASE 1 (未动 — No trigger) → NO TRADE
+  PHASE 2 (冲击  — Shock)      → WAIT; define trigger for PHASE 3
+  PHASE 3 (确认 — Confirmed)  → EXECUTE if Execution Gate passes
+
+Execution Gate (all four must be True):
+  1. structure_break  — structure invalidation has been crossed
+  2. macro_aligned     — macro regime supports the direction
+  3. invalidation_clear — stop-loss level is mathematically defined
+  4. RR >= 1.5         — risk/reward including extension targets >= 1.5
 """
 
 from datetime import datetime
+from enum import Enum
 from typing import Dict, List, Optional
 
 from .strategy import WorkflowStrategy, StrategyConfig
@@ -23,6 +35,28 @@ from ..data.coin_tiers import is_major, normalize_symbol
 # ─── Logging ────────────────────────────────────────────────────────────────
 
 LLM_LOG_FILE = "logs/llm_macro_context.json"
+
+
+# ─── Three-Phase Decision Framework (CLAUDE.md Section 11) ──────────────────────
+
+
+class ThreePhase(Enum):
+    """
+    The three-phase decision states from the Execution Framework.
+
+    PHASE 1 — 未动 (No Movement): No trigger is present. No trade.
+    PHASE 2 — 冲击 (Shock):      A trigger has fired but not yet confirmed.
+                                    WAIT — define the confirmation condition.
+    PHASE 3 — 确认 (Confirmed):    Trigger confirmed. Execute if all gates pass.
+
+    Mindset (CLAUDE.md Section 11.8):
+        没动 → 不做       (no movement → no trade)
+        刚动 → 不追       (just moved → don't chase)
+        动完确认 → 必须做 (movement confirmed → MUST execute)
+    """
+    PHASE_1_NO_TRIGGER  = "PHASE_1_NO_TRIGGER"
+    PHASE_2_SHOCK      = "PHASE_2_SHOCK"
+    PHASE_3_CONFIRMED  = "PHASE_3_CONFIRMED"
 
 
 def _log_macro_context(ctx: dict, symbol: str, trade_decision: str, timestamp: str):
@@ -199,6 +233,180 @@ class HybridWorkflowStrategy:
             return 0.3
         return current_pos_mult
 
+    # ── Three-Phase Decision Framework ─────────────────────────────────────────
+
+    def _three_phase_evaluate(
+        self,
+        analysis: dict,
+        setup: dict,
+        btc_analysis: dict,
+        llm_ctx: dict,
+    ) -> tuple[ThreePhase, Optional[str]]:
+        """
+        Apply the CLAUDE.md Section 11 three-phase decision framework.
+
+        Returns
+        -------
+        (phase, reason)
+            phase : ThreePhase
+                The phase this setup is in.
+            reason : str or None
+                Human-readable reason for logging; None when phase == PHASE_3.
+
+        Phase Logic
+        -----------
+        PHASE 1 — No trigger:
+            The WorkflowStrategy technical check found no signal at all.
+            check_entry() already returns None in this case, so this method
+            is only called when a signal exists.  PHASE 1 here means the
+            signal is present but other conditions indicate "wait".
+
+        PHASE 2 — Shock:
+            A trigger has fired (signal present) but the Execution Gate
+            has not confirmed it.  This is the "just moved" state — do NOT
+            chase.  Keep watching for confirmation.
+
+        PHASE 3 — Confirmed:
+            All four Execution Gate conditions are met:
+                structure_break AND macro_aligned AND invalidation_clear AND RR >= 1.5
+
+        Execution Gate (CLAUDE.md Section 11.4)
+        ---------------------------------------
+            gate = structure_break
+                AND macro_aligned
+                AND invalidation_clear
+                AND RR >= 1.5
+
+        Anti-Avoidance Rule (CLAUDE.md Section 11.6)
+        -----------------------------------------------
+            If outputting NO TRADE in PHASE 3, must explicitly prove ONE of:
+                1. control unclear
+                2. invalidation unclear
+                3. RR < 1.5
+            Otherwise mark as "AVOIDANCE BEHAVIOR".
+        """
+        signal    = analysis.get("signal", "HOLD")
+        direction = setup.get("direction")
+        is_long   = direction.value == "LONG" if direction else False
+
+        macro_regime = llm_ctx.get("macro_regime", "NEUTRAL")
+        btc_strength = llm_ctx.get("btc_strength", "NEUTRAL")
+        volatility   = llm_ctx.get("volatility_warning", "LOW")
+        rr           = setup.get("rr_ratio", 0.0)
+        stop_dist    = setup.get("stop_distance", 0.0)
+        entry        = setup.get("entry", 0.0)
+        stop         = setup.get("stop", 0.0)
+
+        # ── Gate component 1: structure_break ─────────────────────────────
+        # Structure is broken when:
+        #   LONG:  price is below key support / EMA200 bearish
+        #   SHORT: price is above key resistance / EMA200 bullish
+        # We use the technical signal as a proxy: the strategy already
+        # confirmed structure via its own rules.
+        structure_break = signal in ("BUY", "SELL")
+
+        # ── Gate component 2: macro_aligned ─────────────────────────────────
+        # Macro aligns when the direction is supported by the macro regime.
+        if is_long:
+            macro_aligned = macro_regime in ("RISK_ON", "NEUTRAL")
+        else:
+            # Shorts are valid in risk-off (BTC weakness) or neutral
+            macro_aligned = macro_regime in ("RISK_OFF", "NEUTRAL")
+
+        # ── Gate component 3: invalidation_clear ────────────────────────────
+        # Invalidation is clear when a mathematically-defined stop level exists.
+        # Stop must be:
+        #   - Present (not None/0)
+        #   - At least 0.5% away from entry (avoids noise扫 stop)
+        #   - Directionally correct (below entry for longs, above for shorts)
+        stop_too_tight = (
+            entry > 0
+            and stop_dist > 0
+            and stop_dist < 0.005   # < 0.5% = noise zone
+        )
+        invalidation_clear = (
+            stop is not None
+            and stop > 0
+            and entry > 0
+            and (
+                (is_long  and stop < entry)   # long stop must be below entry
+                or (not is_long and stop > entry)  # short stop must be above entry
+            )
+            and not stop_too_tight
+        )
+
+        # ── Gate component 4: RR >= 1.5 (including extension) ─────────────
+        # RR is computed from setup["rr_ratio"] which already includes
+        # extension targets per WorkflowStrategy.
+        rr_pass = rr >= 1.5
+
+        # ── Evaluate gate ───────────────────────────────────────────────────
+        gate_passes = structure_break and macro_aligned and invalidation_clear and rr_pass
+
+        if not gate_passes:
+            reasons = []
+            if not structure_break: reasons.append("no_structure_break")
+            if not macro_aligned:    reasons.append(f"macro={macro_regime}_opposes_{direction.value}")
+            if not invalidation_clear:
+                if stop_too_tight:
+                    reasons.append("stop_<0.5%_(noise_zone)")
+                else:
+                    reasons.append("no_clear_invalidation")
+            if not rr_pass:         reasons.append(f"RR={rr:.2f}_<_1.5")
+            reason = "PHASE_2_SHOCK: " + "; ".join(reasons)
+            return ThreePhase.PHASE_2_SHOCK, reason
+
+        # ── Gate passes → PHASE 3 CONFIRMED ─────────────────────────────────
+        return ThreePhase.PHASE_3_CONFIRMED, None
+
+    def _risk_off_guard_no_llm(
+        self,
+        symbol: str,
+        direction,
+        btc_analysis: dict,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Risk-off enforcement for when LLM is disabled (pure-rule mode).
+
+        Per CLAUDE.md Section 10: ALT LONG is forbidden when:
+            macro = risk_off AND BTC shows weakness signals.
+
+        We derive the regime from btc_analysis alone (no LLM required):
+            risk_off  = BTC close < EMA200
+            btc_weak  = BTC close < EMA200 AND BTC RSI < 45
+
+        This mirrors the gate in _evaluate_execution_gate() so that the
+        enforcement is consistent regardless of whether LLM is on.
+
+        Returns (allowed, reason).
+        """
+        if is_major(symbol):
+            return True, None   # BTC is always permitted
+
+        is_long = direction.value == "LONG" if direction else False
+        if not is_long:
+            return True, None   # Shorts are not restricted by this rule
+
+        if btc_analysis is None:
+            return True, None   # Cannot determine; defer to other gates
+
+        btc_price  = btc_analysis.get("current_price", 0.0)
+        btc_ema200  = btc_analysis.get("ema200", 0.0)
+        btc_rsi    = btc_analysis.get("rsi_14", 50.0)
+
+        risk_off = (btc_price < btc_ema200) if btc_ema200 > 0 else False
+        btc_weak = risk_off and (btc_rsi < 45)
+
+        if risk_off and btc_weak:
+            reason = (
+                f"BLOCKED: ALT LONG forbidden — risk_off detected "
+                f"(BTC < EMA200), btc_weak (RSI < 45). "
+                f"(CLAUDE.md Section 10)"
+            )
+            return False, reason
+
+        return True, None
+
     # ── Entry check (wraps WorkflowStrategy.check_entry) ─────────────────────
 
     def check_entry(
@@ -211,7 +419,15 @@ class HybridWorkflowStrategy:
     ) -> Optional[dict]:
         """
         Technical setup from WorkflowStrategy, then filtered through
-        the LLM Execution Gate.
+        the LLM Execution Gate and the Three-Phase Decision Framework.
+
+        Execution order:
+            1. WorkflowStrategy.check_entry() — pure technical signal
+            2. [LLM disabled path]  Risk-off guard (pure-rule, no LLM needed)
+            3. [LLM enabled path]   LLM macro context + Execution Gate
+            4. Three-Phase Evaluation — structure_break / macro_aligned /
+                                         invalidation_clear / RR >= 1.5
+            5. Volatility Shield — force pos_mult=0.3 on HIGH vol
         """
         # Step 1: Get technical setup from core strategy
         setup = self._core.check_entry(symbol, analysis, equity)
@@ -221,29 +437,65 @@ class HybridWorkflowStrategy:
         direction = setup["direction"]
         ts_str = timestamp.isoformat() if timestamp else datetime.now().isoformat()
 
-        # Step 2: If LLM disabled, return technical setup directly
+        # ── PHASE 1 gate: no valid technical setup already returned None ────
+        # Nothing to do — PHASE_1 means no signal at all.
+
+        llm_ctx: dict = {}
+
+        # Step 2: If LLM disabled — apply pure-rule risk-off guard + skip to Phase eval
         if not self._use_llm:
-            return setup
+            # Pure-rule risk-off enforcement (Section 10)
+            allowed, block_reason = self._risk_off_guard_no_llm(
+                symbol=symbol,
+                direction=direction,
+                btc_analysis=btc_analysis,
+            )
+            if not allowed:
+                print(f"[RISK-OFF GUARD] {symbol} {direction.value}: {block_reason}")
+                return None
+            # Skip LLM context fetch; llm_ctx stays empty (neutral defaults)
+            llm_ctx = {"macro_regime": "NEUTRAL", "btc_strength": "NEUTRAL",
+                       "volatility_warning": "LOW"}
+        else:
+            # Step 3: Get LLM macro context (cached)
+            llm_ctx = self._get_llm_context(
+                symbol=symbol,
+                analysis=analysis,
+                btc_analysis=btc_analysis,
+                timestamp=timestamp or datetime.now(),
+            )
 
-        # Step 3: Get LLM macro context (cached)
-        llm_ctx = self._get_llm_context(
-            symbol=symbol,
+            # Step 3b: Evaluate LLM Execution Gate
+            allowed, block_reason = self._evaluate_execution_gate(
+                symbol=symbol,
+                direction=direction,
+                llm_ctx=llm_ctx,
+                timestamp=ts_str,
+            )
+            if not allowed:
+                print(f"[LLM GATE] {symbol} {direction.value}: {block_reason}")
+                return None
+
+        # ── PHASE 2/3 — Three-Phase Decision Framework ──────────────────────
+        phase, phase_reason = self._three_phase_evaluate(
             analysis=analysis,
+            setup=setup,
             btc_analysis=btc_analysis,
-            timestamp=timestamp or datetime.now(),
+            llm_ctx=llm_ctx,
         )
 
-        # Step 3b: Evaluate Execution Gate
-        allowed, block_reason = self._evaluate_execution_gate(
-            symbol=symbol,
-            direction=direction,
-            llm_ctx=llm_ctx,
-            timestamp=ts_str,
-        )
-        if not allowed:
-            # Override to None = no trade fires
-            print(f"[LLM GATE] {symbol} {direction.value}: {block_reason}")
+        if phase == ThreePhase.PHASE_1_NO_TRIGGER:
+            # Should not be reachable (setup would be None above), but guard anyway
+            print(f"[3-PHASE] {symbol}: PHASE_1_NO_TRIGGER — skipping")
             return None
+
+        if phase == ThreePhase.PHASE_2_SHOCK:
+            # "刚动 → 不追" (just moved — don't chase)
+            print(f"[3-PHASE] {symbol}: {phase_reason}")
+            return None
+
+        # PHASE_3_CONFIRMED — gate passes; execute
+        # (phase == ThreePhase.PHASE_3_CONFIRMED)
 
         # Step 4: Volatility Shield — force conservative sizing on HIGH vol
         original_mult = setup.get("pos_mult", self._core.config.pos_mult)

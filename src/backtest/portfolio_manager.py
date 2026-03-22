@@ -419,6 +419,7 @@ class DynamicAllocator:
         lookback: int = 30,
         temperature: float = 1.0,
         penalty_factor: float = 0.1,
+        initial_capital: float = 10_000.0,
     ):
         if not personas:
             raise ValueError("DynamicAllocator requires at least one persona.")
@@ -428,6 +429,9 @@ class DynamicAllocator:
         self.lookback         = lookback
         self.temperature      = temperature
         self.penalty_factor   = penalty_factor
+        # FIX #55: Store initial_capital for turnover denominator (turnover should
+        # always be normalised against the starting capital, not position[0]).
+        self.initial_capital  = initial_capital
 
         # Per-persona rolling states
         self._states: Dict[PersonaType, PersonaState] = {
@@ -483,9 +487,10 @@ class DynamicAllocator:
         sortino  = calculate_sortino(returns)
         win_rate = state.win_rate()
 
-        # Use the LAST position as initial capital for turnover
-        # (more accurate for live capital tracking)
-        initial_cap = positions[0] if positions else 1.0
+        # FIX #55: Turnover denominator must be the initial capital, not the first
+        # position value. Using positions[0] biases turnover when the first epoch
+        # had a large position, making subsequent turnover appear artificially low.
+        initial_cap = self.initial_capital
         turnover    = calculate_turnover(positions, initial_cap)
 
         fitness = calculate_fitness(

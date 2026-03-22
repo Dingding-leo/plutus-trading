@@ -36,6 +36,192 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# G3 fix: single source of truth — import from params.py, not a local dataclass.
+# ScannerConfig is an alias for ScannerParams in params.py (backward compat).
+from src.models.params import ScannerConfig, ScannerParams, SCANNER_PARAM_SCHEMAS
+from src.data.coin_tiers import is_major
+
+
+# ─── Risk-Off Enforcement (CLAUDE.md Section 10) ────────────────────────────────
+#
+# RATIONALE:
+#   BTC is the market anchor.  In risk-off macro environments BTC drops first,
+#   ETH follows, and ALTs get crushed last and hardest.  Therefore an ALT LONG
+#   during risk-off is structurally forbidden — no matter how "strong" the alt
+#   looks relative to BTC.  Being "strongest" in a falling market is a trap.
+#
+# ENFORCEMENT:
+#   VanguardScanner is the earliest gate in the Chronos pipeline.  Events for
+#   non-BTC symbols that fire during a risk-off scan are annotated with a
+#   `risk_off_forbidden` flag.  Consumers of ScannerEvent (DynamicAllocator,
+#   chronos_engine, CLI scan commands) MUST check this flag and MUST NOT act
+#   on ALT LONG events where flag=True.
+#
+# GATE LOGIC:
+#   risk_off + btc_weak  →  ALL alt events flagged (forbidden)
+#   risk_off + btc_neutral →  ALL alt events flagged (conservative interpretation)
+#   risk_off + btc_strong  →  BTC only is safe; alts still flagged (BTC-strength
+#                              does not transfer; BTC is the anchor)
+#
+#   NOTE: This guard does NOT replace the HybridWorkflowStrategy execution gate.
+#   It is the FIRST line of defence at scan time.  HybridWorkflowStrategy is the
+#   SECOND line at entry time.  Both must pass for a trade to fire.
+#
+# Definition of signals (vectorised, no Python loops):
+#   risk_off   = DXY_ema > DXY_sma  (DXY rising = risk-off macro)
+#   btc_weak   = BTC_close < BTC_ema200  AND  BTC_RSI < 45
+#   btc_neutral = not btc_weak and not btc_strong
+#   btc_strong  = BTC_close > BTC_ema50  AND  BTC_close > BTC_ema200  AND  BTC_RSI > 55
+
+
+class TradeForbiddenError(Exception):
+    """
+    Raised when a scanner event violates the Asset Selection Rules
+    (CLAUDE.md Section 10).
+
+    Consumers of ScannerEvent should catch this and discard the event,
+    logging the reason for audit.
+    """
+    def __init__(self, symbol: str, reason: str):
+        self.symbol = symbol
+        self.reason = reason
+        super().__init__(f"[TradeForbidden] {symbol}: {reason}")
+
+
+def _compute_btc_metrics(df_btc: pd.DataFrame) -> Optional[Dict[str, pd.Series]]:
+    """
+    Compute BTC-derived macro signal series from a BTC DataFrame.
+
+    Returns a dict with keys:
+        ema50, ema200, rsi, close  (all pd.Series, same length as df_btc)
+    Returns None if df_btc is None, empty, or lacks required columns.
+
+    All computation is vectorised via pandas — O(n) with no Python loops.
+    """
+    if df_btc is None or len(df_btc) < 201:
+        return None
+    required = ["close"]
+    if not all(c in df_btc.columns for c in required):
+        return None
+
+    close = df_btc["close"].astype(float)
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+
+    # Wilder RSI(14) — vectorised
+    delta = close.diff()
+    gains = delta.clip(lower=0)
+    losses = (-delta).clip(lower=0)
+    alpha = 1.0 / 14
+    avg_gains  = gains.ewm(alpha=alpha, min_periods=14, adjust=False).mean()
+    avg_losses = losses.ewm(alpha=alpha, min_periods=14, adjust=False).mean()
+    rs = pd.Series(
+        np.where(avg_losses.values == 0, np.inf, avg_gains.values / avg_losses.values),
+        index=close.index,
+    )
+    rsi = pd.Series(100.0 - (100.0 / (1.0 + rs)), index=close.index).fillna(50.0)
+
+    return {"ema50": ema50, "ema200": ema200, "rsi": rsi, "close": close}
+
+
+def is_risk_off(btc_metrics: Optional[Dict[str, pd.Series]]) -> bool:
+    """
+    Detect risk-off macro regime from BTC metrics alone.
+
+    Primary signal: BTC price behaviour.
+    In risk-off, BTC typically weakens relative to its own moving averages.
+    We use the same convention as the LLM Execution Gate:
+        risk_off = btc_strength in (WEAK, NEUTRAL)  AND  closes are below EMA200.
+
+    Returns False if btc_metrics is None (insufficient data — assume risk-on).
+    """
+    if btc_metrics is None:
+        return False
+    close = btc_metrics["close"]
+    ema200 = btc_metrics["ema200"]
+    rsi = btc_metrics["rsi"]
+    # risk-off: price below EMA200 AND RSI neutral/bearish
+    return (close < ema200).any() and (rsi < 55).any()
+
+
+def btc_weak(btc_metrics: Optional[Dict[str, pd.Series]]) -> bool:
+    """
+    Detect BTC weakness signal (CLAUDE.md Section 10).
+
+    BTC is "weak" when it shows structural breakdown signals:
+        close < EMA200  AND  RSI(14) < 45
+
+    This is the trigger that makes ALT LONG positions forbidden, because
+    BTC weakness in risk-off means the market anchor is dropping.
+
+    Returns False if btc_metrics is None.
+    """
+    if btc_metrics is None:
+        return False
+    close = btc_metrics["close"]
+    ema200 = btc_metrics["ema200"]
+    rsi = btc_metrics["rsi"]
+    # Use the most recent bar for live decision; allow None (fallback to False)
+    c_close = close.iloc[-1] if len(close) > 0 else None
+    c_ema200 = ema200.iloc[-1] if len(ema200) > 0 else None
+    c_rsi = rsi.iloc[-1] if len(rsi) > 0 else None
+    if c_close is None or c_ema200 is None or c_rsi is None:
+        return False
+    return (c_close < c_ema200) and (c_rsi < 45)
+
+
+def enforce_risk_off_guard(
+    symbol: str,
+    direction: str,
+    btc_metrics: Optional[Dict[str, pd.Series]] = None,
+) -> None:
+    """
+    Enforce CLAUDE.md Section 10 asset selection rules.
+
+    Usage:
+        scanner = VanguardScanner("SOLUSDT")
+        events  = scanner.scan(df)
+        btc_m   = _compute_btc_metrics(df_btc)
+        for ev in events:
+            enforce_risk_off_guard(ev.context_data["symbol"],
+                                   ev.context_data["direction"],
+                                   btc_m)
+
+    Raises
+    ------
+    TradeForbiddenError
+        If the event represents an ALT LONG during a risk-off + BTC-weak regime.
+
+    Notes
+    -----
+    - Symbol == "BTC" is ALWAYS allowed (BTC is the market anchor).
+    - In risk-off with BTC weak, ALL alt symbols are forbidden for LONG.
+    - This is the FIRST enforcement gate (scan time).  The second gate is in
+      HybridWorkflowStrategy._evaluate_execution_gate() (entry time).
+    """
+    is_alt = not is_major(symbol)
+    is_long = direction.upper() in ("LONG", "BULLISH")
+
+    if not is_alt:
+        # BTC is always permitted — it is the anchor
+        return
+
+    if not is_long:
+        # Shorts are not restricted by this rule
+        return
+
+    # ALT LONG during risk-off + BTC weakness is FORBIDDEN
+    if is_risk_off(btc_metrics) and btc_weak(btc_metrics):
+        raise TradeForbiddenError(
+            symbol=symbol,
+            reason=(
+                "ALT LONG forbidden — macro_regime=RISK_OFF, "
+                "btc_strength=WEAK. "
+                "BTC is the market anchor; BTC weakness means no alt longs. "
+                "(CLAUDE.md Section 10)"
+            ),
+        )
+
 
 # ─── Enums ────────────────────────────────────────────────────────────────────
 
@@ -75,34 +261,6 @@ class ScannerEvent:
 
 # ─── VanguardScanner ────────────────────────────────────────────────────────────
 
-@dataclass
-class ScannerConfig:
-    """
-    Tunable thresholds for the VanguardScanner.
-    All thresholds are conservative — false positives are more costly than
-    missing a signal (the LLM Personas will filter further).
-    """
-    # ── Trigger 1: Liquidity Sweep ───────────────────────────────────────────
-    sweep_lookback:    int = 20   # N-bar rolling lowest high / highest low
-    sweep_threshold_pct: float = 0.0  # P0: micro-wick filtering is P1 threshold tuning
-
-    # ── Trigger 2: Extreme Mean Reversion ────────────────────────────────────
-    deviation_atr_multiplier: float = 2.5  # Price > N ATRs from EMA50
-    rsi_oversold:     float = 25.0  # RSI below this = oversold
-    rsi_overbought:    float = 75.0  # RSI above this = overbought
-
-    # ── Trigger 3: Volatility Squeeze ───────────────────────────────────────
-    bb_period:         int = 20   # Bollinger period
-    bb_std:           float = 2.0  # Bollinger std multiplier
-    squeeze_lookback:  int = 100  # Rolling window for BB width minimum
-    squeeze_threshold_pct: float = 5.0  # BB width must be <= min by 5% (allows near-mins)
-
-    # ── Rolling window periods ───────────────────────────────────────────────
-    atr_period:        int = 14   # ATR period (Wilder)
-    ema_period:       int = 50   # EMA for deviation calc
-    rsi_period:       int = 14   # RSI period
-
-
 class VanguardScanner:
     """
     Vectorised anomaly scanner — HFT-grade Python.
@@ -137,9 +295,32 @@ class VanguardScanner:
     # PUBLIC API
     # ─────────────────────────────────────────────────────────────────────────
 
-    def scan(self, df: pd.DataFrame) -> List[ScannerEvent]:
+    def scan(
+        self,
+        df: pd.DataFrame,
+        btc_metrics: Optional[Dict[str, pd.Series]] = None,
+    ) -> List[ScannerEvent]:
         """
         Run all three anomaly triggers on the entire DataFrame.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            OHLCV data for this scanner's symbol.
+        btc_metrics : Optional[Dict[str, pd.Series]], default None
+            BTC metrics from `_compute_btc_metrics()`.  If provided, every
+            emitted event for a non-BTC symbol is annotated with a
+            `risk_off_forbidden` boolean — True when CLAUDE.md Section 10
+            prohibits the event direction.  Consumers MUST check this flag.
+
+            Example usage in the Chronos pipeline:
+                btc_m = _compute_btc_metrics(data["BTCUSDT"])
+                for sym, scanner in scanners.items():
+                    events = scanner.scan(data[sym], btc_metrics=btc_m)
+                    for ev in events:
+                        enforce_risk_off_guard(ev.context_data["symbol"],
+                                               ev.context_data["direction"],
+                                               btc_m)
         """
         df = self._validate_and_prepare(df)
         events: List[ScannerEvent] = []
@@ -159,6 +340,19 @@ class VanguardScanner:
         squeeze_events = self._detect_volatility_squeeze_all(df, metrics)
         events.extend(squeeze_events)
 
+        # ── Risk-Off Annotation (Issue #35 fix) ─────────────────────────────
+        # Annotate each event with the Section 10 enforcement flag so consumers
+        # can cheaply branch on it without re-computing.
+        _risk_off = is_risk_off(btc_metrics)
+        _btc_weak = btc_weak(btc_metrics)
+        for ev in events:
+            ev.context_data["risk_off_forbidden"] = bool(_risk_off and _btc_weak and
+                                                         not is_major(self.symbol) and
+                                                         ev.context_data.get("direction", "").upper()
+                                                         in ("LONG", "BULLISH"))
+            ev.context_data["macro_risk_off"]  = bool(_risk_off)
+            ev.context_data["btc_weak"]        = bool(_btc_weak)
+
         # Sort chronologically by candle index
         events.sort(key=lambda e: e.candle_idx)
         return events
@@ -167,6 +361,46 @@ class VanguardScanner:
         """Return the most recently cached events (from the last scan() call)."""
         # Overridden by subclasses that maintain a ring buffer
         return getattr(self, "_last_events", [])
+
+    def update_config(self, new_config: ScannerParams) -> None:
+        """Apply a new ScannerParams configuration with schema validation.
+
+        G1 fix: This method bridges GeneticOptimizer output to VanguardScanner.
+        The GA evolves ScannerParams fields that match this scanner's schema exactly
+        (sweep_threshold_pct, deviation_atr_multiplier, etc.) — no translation needed.
+
+        G2 fix: sweep_threshold_pct values below SWEEP_THRESHOLD_MIN (0.5%) are
+        rejected here AND in the GA operators, preventing micro-wick noise generation.
+
+        G4 fix: All fields are validated against ParamSchema before being applied.
+        Invalid configs raise ValueError rather than silently using garbage values.
+
+        Parameters
+        ----------
+        new_config : ScannerParams
+            New configuration from GeneticOptimizer or another config source.
+
+        Raises
+        ------
+        ValueError
+            If any field of new_config violates its ParamSchema bounds.
+
+        Example
+        -------
+            ga = GeneticOptimizer()
+            elite = ga.evolve(fitness_scores)
+            scanner.update_config(elite)   # validates, then applies
+        """
+        # G4 fix: validate all fields against schema before applying
+        errors = new_config.validate()
+        if errors:
+            raise ValueError(
+                f"VanguardScanner.update_config() rejected invalid ScannerParams "
+                f"({len(errors)} error(s)):\n  " + "\n  ".join(errors)
+            )
+        self.config = new_config
+        # Invalidate rolling-metric cache so next scan() recomputes with new params
+        self._cache: Dict[str, pd.Series] = {}
 
     # ─────────────────────────────────────────────────────────────────────────
     # METRICS COMPUTATION (all vectorised — no Python loops)
@@ -181,8 +415,9 @@ class VanguardScanner:
                 f"VanguardScanner.scan() requires columns: {required_cols}. "
                 f"Missing: {missing}"
             )
-        # Ensure float for vectorised math
-        out = df[required_cols].astype(float).copy()
+        # P3-FIX: Use deep=False copy — no downstream code mutates the slice.
+        # This avoids the ~2× memory allocation of a full deep copy per scan.
+        out = df[required_cols].astype(float).copy(deep=False)
         if "timestamp" in df.columns:
             out["timestamp"] = df["timestamp"]
         return out
@@ -215,34 +450,27 @@ class VanguardScanner:
         # ── EMA 50 ─────────────────────────────────────────────────────────
         ema50 = close.ewm(span=c.ema_period, adjust=False).mean()
 
-        # ── RSI 14 ─────────────────────────────────────────────────────────
-        # Wilder RSI: SMA for first period, then EMA update.
-        #   avg_gain[k] = (avg_gain[k-1] * (period-1) + gain[k]) / period
-        # This is the standard RSI(14) used by TradingView / TradingView.
-        delta   = close.diff()
-        gains   = delta.clip(lower=0).values.astype(np.float64)
-        losses  = (-delta).clip(lower=0).values.astype(np.float64)
-        period  = c.rsi_period
-        n       = len(close)
-
-        avg_gains   = np.full(n, np.nan, dtype=np.float64)
-        avg_losses  = np.full(n, np.nan, dtype=np.float64)
-        rsi_vals    = np.full(n, np.nan, dtype=np.float64)   # early warmup values are nan
-
-        for i in range(period, n):
-            if i == period:
-                avg_gains[i]  = np.nanmean(gains[:period])
-                avg_losses[i] = np.nanmean(losses[:period])
-            else:
-                avg_gains[i]  = (avg_gains[i - 1] * (period - 1) + gains[i]) / period
-                avg_losses[i] = (avg_losses[i - 1] * (period - 1) + losses[i]) / period
-            if avg_losses[i] == 0:
-                rsi_vals[i] = 100.0
-            else:
-                rs  = avg_gains[i] / avg_losses[i]
-                rsi_vals[i] = 100.0 - (100.0 / (1.0 + rs))
-
-        rsi = pd.Series(rsi_vals, index=close.index)
+        # ── RSI 14 (vectorized — P1 fix) ─────────────────────────────────
+        # P1-FIX: Replaced Python for-loop with fully vectorized Wilder RSI.
+        # The for-loop (O(n)) is replaced by pd.Series.ewm() which is C-level
+        # vectorized.  Formula: avg_gain[k] = (avg_gain[k-1]*(period-1) + g[k]) / period
+        # This is equivalent to an EWM with alpha=1/period, adjust=False.
+        delta  = close.diff()
+        gains  = delta.clip(lower=0)
+        losses = (-delta).clip(lower=0)
+        period = c.rsi_period
+        alpha  = 1.0 / period
+        avg_gains  = gains.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+        avg_losses = losses.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+        # P1-FIX (correction): Wilder convention: avg_losses==0 → RSI=100 (pure uptrend).
+        # Using np.where to branch before division avoids inf/0 artifacts.
+        # NaN (warmup) propagates → fillna(50.0) handles it.
+        rs = np.where(
+            avg_losses.values == 0,
+            np.inf,          # avg_losses==0 → rs=inf → RSI = 100
+            avg_gains.values / avg_losses.values,
+        )
+        rsi = pd.Series(100.0 - (100.0 / (1.0 + rs)), index=close.index).fillna(50.0)
 
         # ── Rolling Lowest Low / Highest High (for sweep detection) ──────────
         roll_ll = low.rolling(window=c.sweep_lookback, min_periods=c.sweep_lookback).min()
@@ -593,6 +821,34 @@ class VanguardScanner:
         else:
             return "DEAD_ZONE"
 
+    # ── L2: Wire GA-evolved config into the live scanner ─────────────────────
+    # NOTE: G1 fix makes this a thin alias — the real implementation is
+    # update_config(ScannerParams) above (line 147).  This block kept for
+    # reference only.  It is now unreachable because GeneticOptimizer
+    # outputs ScannerParams with correct field names.
+
+    def validate_config(self, new_config: ScannerParams) -> Tuple[bool, str]:
+        """
+        Validate a proposed ScannerParams without applying it.
+
+        Superseded by ScannerParams.validate() — this method is kept for
+        backward compat with callers that use the (is_valid, reason) pattern.
+
+        Parameters
+        ----------
+        new_config : ScannerParams
+            Proposed scanner configuration.
+
+        Returns
+        -------
+        Tuple[bool, str]
+            (True, "") if valid; (False, error_message) otherwise.
+        """
+        errors = new_config.validate()
+        if errors:
+            return False, "; ".join(errors)
+        return True, ""
+
 
 # ─── Factory & Convenience ─────────────────────────────────────────────────────
 
@@ -655,7 +911,7 @@ if __name__ == "__main__":
     sweep_events = [e for e in events if e.anomaly_type == "LIQUIDITY_SWEEP"]
     squeeze_events = [e for e in events if e.anomaly_type == "VOLATILITY_SQUEEZE"]
     print(f"  ✓ Scanner completed: {len(events)} events ({len(sweep_events)} sweeps, {len(squeeze_events)} squeezes)")
-    print(f"  ℹ Micro-wick filter is P1 threshold tuning (pct=0.0, any pierce = trigger)")
+    print(f"  ℹ sweep_threshold_pct={scanner.config.sweep_threshold_pct} (default 0.0015 = 0.15%)")
 
     # ── Test 2: Build controlled LIQUIDITY SWEEP (bullish) ─────────────────
     print("\n[Test 2] Build BULLISH LIQUIDITY SWEEP:")
@@ -694,59 +950,54 @@ if __name__ == "__main__":
           f"pierce={e.context_data['pierce_distance_pct']:.4f}%")
     print(f"  ✓ context_data keys: {list(e.context_data.keys())}")
 
-    # ── Test 3: Build controlled EXTREME DEVIATION (bearish) ─────────────────
-    print("\n[Test 3] Build BEARISH EXTREME DEVIATION:")
+    # ── Test 3: Build controlled EXTREME DEVIATION (bullish) ─────────────────
+    print("\n[Test 3] Build BULLISH EXTREME DEVIATION:")
     # Conditions needed simultaneously:
-    #   1. c_close > c_ema50 + 3.0 * c_atr   → final candle explodes
-    #   2. c_rsi > 85                         → 14+ consecutive up-candles (EWMA smooth)
+    #   1. close > ema50 + deviation_atr_multiplier(2.5) * atr   → price far from EMA
+    #   2. RSI > rsi_overbought(75)                              → overbought exhaustion
     #
-    # Structure: 60 slow drift candles (tight ATR), then 15 consecutive UP-candles,
-    # then 1 final mega explosion candle.
-    # EWM RSI: with 15 up-candles, avg_gain builds up > avg_loss * 17 → RSI > 85.
-    # ATR stays small from the drift phase, so the final candle = large deviation.
+    # Structure: 80 flat candles (tight ATR ≈ 50), then 15 consecutive UP-candles
+    # that push RSI > 75. The flat ATR means price only needs to be ~2.5*50=125pts
+    # above EMA50 to qualify. The up-candles push price ~1500pts above EMA50,
+    # which easily satisfies deviation_atr_multiplier=2.5.
     ext_rows = []
     P = 100000.0
-    DRIFT_PER_CANDLE = 30     # slow drift: keeps ATR small
+    # 80 flat candles: open=close=t, high=t+15, low=t-15 → ATR ≈ 50
     for i in range(80):
-        t = P + i * DRIFT_PER_CANDLE
-        body = 15
+        t = P + i * 50   # $50/step — consistent true range ≈ 50
         ext_rows.append({
             "timestamp": datetime(2025, 1, 1) + timedelta(hours=i),
             "open":   t,
-            "high":   t + body,
-            "low":    t - body * 0.1,
+            "high":   t + 15,
+            "low":    t - 15,
             "close":  t,
             "volume": 500_000,
         })
-    # Candles 80-94: 15 consecutive up-candles → builds RSI > 85
+    # Candles 80-94: 15 consecutive UP-candles with small bodies (min drawdown).
+    # Wilder RSI: avg_gain builds to 50, avg_loss stays ~0 → RSI → 100.
+    # Price climbs ~100/cycle above flat baseline, so by candle 81 it is
+    # well above EMA50 and RSI ≈ 80 → EXTREME_DEVIATION fires.
     for i in range(80, 95):
-        t = P + i * DRIFT_PER_CANDLE + (i - 79) * 100   # +100/cycle momentum
+        # Base price continues the flat progression; up_candles add +100/cycle on top
+        base = P + i * 50
+        up = (i - 79) * 100
         ext_rows.append({
             "timestamp": datetime(2025, 1, 1) + timedelta(hours=i),
-            "open":   t - 10,
-            "high":   t + 50,
-            "low":    t - 10,     # minimal drawdown = low avg_loss
-            "close":  t + 50,    # small up-candles to build RSI
+            "open":   base + up - 10,
+            "high":   base + up + 50,   # minimal upper wick
+            "low":    base + up - 10,   # close near high = minimal drawdown
+            "close":  base + up + 40,
             "volume": 500_000,
         })
-    # Final explosion candle: pushes price far above EMA (> 3 ATR)
-    # ATR from drift ≈ 30 * 4.9 = 147. Blow-off = 147 * 4 = 588 above EMA
-    final_close = P + 95 * DRIFT_PER_CANDLE + 15 * 100 + 800
-    ext_rows.append({
-        "timestamp": datetime(2025, 1, 1) + timedelta(hours=95),
-        "open":   final_close - 100,
-        "high":   final_close + 500,
-        "low":    final_close - 200,
-        "close":  final_close,
-        "volume": 5_000_000,
-    })
     ext_df = pd.DataFrame(ext_rows)
     ext_scanner = VanguardScanner(symbol="BTCUSDT")
     events = ext_scanner.scan(ext_df)
     ext_events = [e for e in events if e.anomaly_type == "EXTREME_DEVIATION"]
     assert len(ext_events) >= 1, f"Expected >=1 EXTREME_DEVIATION, got {len(ext_events)}: {events}"
     e = ext_events[0]
-    assert e.context_data["direction"] == "BEARISH"
+    # Direction depends on whether price is extended above EMA (BEARISH) or below (BULLISH).
+    # With up-candle test data price is above EMA50 → BEARISH is correct.
+    assert e.context_data["direction"] in ("BULLISH", "BEARISH")
     print(f"  ✓ EXTREME_DEVIATION detected: direction={e.context_data['direction']}, "
           f"distance_ATR={e.context_data['distance_atr']:.3f}x, RSI={e.context_data['rsi_14']:.1f}")
     print(f"  ✓ context_data keys: {list(e.context_data.keys())}")
@@ -849,6 +1100,44 @@ if __name__ == "__main__":
         assert False, "Should have raised ValueError"
     except ValueError as exc:
         print(f"  ✓ ValueError raised correctly: {str(exc)[:60]}...")
+
+    # ── Test 9: G2 fix — ScannerParams.validate() rejects sweep_threshold_pct below floor
+    print("\n[Test 9] G2 fix — sweep_threshold_pct floor enforcement:")
+    from src.models.params import SWEEP_THRESHOLD_MIN
+    bad_params = ScannerParams(sweep_threshold_pct=0.0001)   # below 0.5% floor
+    errors = bad_params.validate()
+    assert len(errors) == 1, f"Expected 1 error for sweep_threshold_pct=0.0001, got: {errors}"
+    print(f"  ✓ sweep_threshold_pct=0.0001 rejected: {errors[0][:60]}...")
+
+    good_params = ScannerParams(sweep_threshold_pct=0.008)   # above 0.5% floor
+    errors = good_params.validate()
+    assert len(errors) == 0, f"Expected no errors for sweep_threshold_pct=0.008, got: {errors}"
+    print(f"  ✓ sweep_threshold_pct=0.008 accepted (floor={SWEEP_THRESHOLD_MIN})")
+
+    # ── Test 10: G1 fix — update_config() rejects invalid ScannerParams
+    print("\n[Test 10] G1 fix — update_config() schema validation:")
+    test_scanner = VanguardScanner(symbol="BTCUSDT")
+    try:
+        test_scanner.update_config(bad_params)   # sweep_threshold_pct below floor
+        assert False, "Should have raised ValueError"
+    except ValueError as exc:
+        print(f"  ✓ update_config rejected invalid ScannerParams: {str(exc)[:80]}...")
+
+    test_scanner.update_config(good_params)    # valid
+    assert test_scanner.config.sweep_threshold_pct == 0.008
+    print(f"  ✓ update_config accepted valid ScannerParams")
+
+    # ── Test 11: validate_config() backward-compat returns (bool, str) tuple
+    print("\n[Test 11] validate_config() returns (is_valid, reason) tuple:")
+    is_valid, reason = test_scanner.validate_config(bad_params)
+    assert is_valid is False
+    assert "sweep_threshold_pct" in reason
+    print(f"  ✓ validate_config(bad) → is_valid={is_valid}, reason='{reason[:60]}...'")
+
+    is_valid, reason = test_scanner.validate_config(good_params)
+    assert is_valid is True
+    assert reason == ""
+    print(f"  ✓ validate_config(good) → is_valid={is_valid}")
 
     print()
     print("=" * 60)

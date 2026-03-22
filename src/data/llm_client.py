@@ -21,7 +21,15 @@ DEFAULT_MODEL = os.environ.get("LLM_MODEL", "MiniMax-M2.7")
 class LLMClient:
     """Client for LLM API (MiniMax)."""
 
-    def __init__(self, api_key: str = None, base_url: str = None, model: str = None, cache_ttl: int = 300):
+    def __init__(
+        self,
+        api_key: str = None,
+        base_url: str = None,
+        model: str = None,
+        cache_ttl: int = 300,
+        circuit_breaker_failures: int = 3,
+        circuit_breaker_cooldown: int = 300,
+    ):
         self.api_key = api_key or os.environ.get("LLM_API_KEY", "")
         if not self.api_key:
             raise ValueError(
@@ -32,24 +40,35 @@ class LLMClient:
         self.model = model or DEFAULT_MODEL
         self._response_cache: dict = {}
         self._cache_ttl = cache_ttl
+        # Circuit breaker state
+        self._cb_failures: int = 0
+        self._cb_failures_max: int = circuit_breaker_failures
+        self._cb_cooldown: int = circuit_breaker_cooldown  # seconds
+        self._cb_open_until: float = 0.0  # unix timestamp
 
     def _compute_cache_key(self, messages: List[Dict], temperature: float) -> str:
         content = "".join(m.get("content", "") for m in messages)
-        return hashlib.md5(f"{content}:{temperature}".encode()).hexdigest()
+        return hashlib.sha256(f"{content}:{temperature}".encode()).hexdigest()
 
     def chat(
         self,
         messages: List[Dict[str, str]],
         temperature: float = 0.3,
         max_retries: int = 3,
+        cache_bypass: bool = False,
     ) -> str:
         """Send chat request with exponential backoff for rate limits/errors."""
-        # Check cache first
+        # Circuit breaker: if open, return fallback immediately
+        if time.time() < self._cb_open_until:
+            raise Exception("LLM circuit breaker is OPEN — returning safe fallback (no trade).")
+
+        # Check cache first (skip if bypass is set)
         cache_key = self._compute_cache_key(messages, temperature)
-        if cache_key in self._response_cache:
-            cached = self._response_cache[cache_key]
-            if time.time() - cached['timestamp'] < self._cache_ttl:
-                return cached['response']
+        if not cache_bypass:
+            if cache_key in self._response_cache:
+                cached = self._response_cache[cache_key]
+                if time.time() - cached['timestamp'] < self._cache_ttl:
+                    return cached['response']
 
         url = f"{self.base_url}/text/chatcompletion_v2"
 
@@ -88,6 +107,8 @@ class LLMClient:
 
                 if "choices" in data and len(data["choices"]) > 0:
                     result = data["choices"][0]["message"]["content"]
+                    # Reset circuit breaker on success
+                    self._cb_failures = 0
                     # Cache the result
                     self._response_cache[cache_key] = {'response': result, 'timestamp': time.time()}
                     return result
@@ -100,8 +121,16 @@ class LLMClient:
                 if attempt < max_retries - 1:
                     time.sleep((2 ** attempt) * 5)  # scale up for network errors too
                     continue
+                # Circuit breaker: count this failure and trip if threshold reached
+                self._cb_failures += 1
+                if self._cb_failures >= self._cb_failures_max:
+                    self._cb_open_until = time.time() + self._cb_cooldown
                 raise Exception(f"Network error after {max_retries} attempts: {e}")
 
+        # All retries exhausted without success — trip circuit breaker
+        self._cb_failures += 1
+        if self._cb_failures >= self._cb_failures_max:
+            self._cb_open_until = time.time() + self._cb_cooldown
         raise Exception("Max retries exceeded")
 
     async def async_chat(
@@ -109,10 +138,15 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.3,
         max_retries: int = 3,
+        cache_bypass: bool = False,
     ) -> str:
         """Async version of chat using aiohttp."""
         import aiohttp
         import asyncio
+
+        # Circuit breaker: if open, return fallback immediately
+        if time.time() < self._cb_open_until:
+            raise Exception("LLM circuit breaker is OPEN — returning safe fallback (no trade).")
 
         url = f"{self.base_url}/text/chatcompletion_v2"
         headers = {
@@ -121,9 +155,21 @@ class LLMClient:
         }
         payload = {"model": self.model, "messages": messages, "temperature": temperature}
 
-        for attempt in range(max_retries):
-            try:
-                async with aiohttp.ClientSession() as session:
+        # Check cache (skip if bypass is set — Issue #50)
+        cache_key = self._compute_cache_key(messages, temperature)
+        if not cache_bypass:
+            if cache_key in self._response_cache:
+                cached = self._response_cache[cache_key]
+                if time.time() - cached['timestamp'] < self._cache_ttl:
+                    return cached['response']
+
+        last_error: Exception = None
+        # Create session ONCE before the retry loop and reuse it across all
+        # retry attempts — prevents the session-leak caused by creating a new
+        # ClientSession inside each retry iteration (Issue #34).
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(max_retries):
+                try:
                     async with session.post(url, json=payload, headers=headers, timeout=60) as response:
                         if response.status == 429:
                             retry_after = int(response.headers.get("Retry-After", 60))
@@ -137,21 +183,79 @@ class LLMClient:
                         response.raise_for_status()
                         data = await response.json()
                         if "choices" in data and len(data["choices"]) > 0:
-                            return data["choices"][0]["message"]["content"]
+                            # Reset circuit breaker on success
+                            self._cb_failures = 0
+                            result = data["choices"][0]["message"]["content"]
+                            self._response_cache[cache_key] = {'response': result, 'timestamp': time.time()}
+                            return result
                         elif "base_resp" in data:
                             raise Exception(f"API Error: {data['base_resp']['status_msg']}")
                         else:
                             raise Exception(f"Unexpected response: {data}")
-            except aiohttp.ClientError as e:
-                if attempt < max_retries - 1:
-                    await asyncio.sleep((2 ** attempt) * 5)
-                    continue
-                raise Exception(f"Network error after {max_retries} attempts: {e}")
+                except aiohttp.ClientError as e:
+                    last_error = Exception(f"Network error after {max_retries} attempts: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep((2 ** attempt) * 5)
+                        continue
+                    # Circuit breaker: count this failure and trip if threshold reached
+                    self._cb_failures += 1
+                    if self._cb_failures >= self._cb_failures_max:
+                        self._cb_open_until = time.time() + self._cb_cooldown
+                    raise last_error
+
+        # All retries exhausted — trip circuit breaker
+        self._cb_failures += 1
+        if self._cb_failures >= self._cb_failures_max:
+            self._cb_open_until = time.time() + self._cb_cooldown
         raise Exception("Max retries exceeded")
 
 
-# Default client - requires LLM_API_KEY environment variable to be set
-llm_client = LLMClient()
+class _LazyLLMClientProxy:
+    """
+    Lazy proxy that defers LLMClient() instantiation until first use.
+
+    This prevents the app from crashing on import when LLM_API_KEY is not set
+    (e.g. during CI, testing, or when only the dashboard is running).
+    """
+
+    __slots__ = ("_client",)
+
+    def __init__(self) -> None:
+        self._client: "LLMClient | None" = None
+
+    def _get(self) -> LLMClient:
+        if self._client is None:
+            self._client = LLMClient()
+        return self._client
+
+    def chat(self, *args, **kwargs) -> str:
+        return self._get().chat(*args, **kwargs)
+
+    async def async_chat(self, *args, **kwargs) -> str:
+        return await self._get().async_chat(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        # Forward any other attribute access to the real client
+        return getattr(self._get(), name)
+
+
+# Default client — lazily instantiated so the app starts without LLM_API_KEY.
+# Call get_llm_client() to get (or create) the shared instance.
+_llm_client: "LLMClient | None" = None
+
+
+def get_llm_client() -> LLMClient:
+    """Lazily create and return the shared LLMClient instance."""
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = LLMClient()
+    return _llm_client
+
+
+# Keep the module-level name for backward compatibility ( callers use llm_client.chat(...) )
+import sys as _sys
+llm_client = _LazyLLMClientProxy()
+_sys.modules[__name__].llm_client = llm_client
 
 
 # ─── VALID ENUMS (enforced by prompt + parser) ────────────────────────────────
@@ -497,9 +601,90 @@ Respond in JSON format:
         # Validate required fields
         if parsed.get("decision") not in {"BUY", "SELL", "NO_TRADE"}:
             return {"decision": "NO_TRADE", "symbol": "NONE", "risk_level": "MODERATE", "reason": "Invalid decision from LLM"}
+
+        decision = parsed["decision"]
         stop_loss = parsed.get("stop_loss")
-        if stop_loss is not None and (not isinstance(stop_loss, (int, float)) or stop_loss <= 0):
-            return {"decision": "NO_TRADE", "symbol": "NONE", "risk_level": "MODERATE", "reason": "Invalid stop_loss from LLM"}
+        take_profit = parsed.get("take_profit")
+
+        # Determine entry price for distance calculations
+        if decision == "BUY":
+            entry_price = target_data.get("current_price", btc_data.get("current_price", 0))
+        elif decision == "SELL":
+            entry_price = target_data.get("current_price", btc_data.get("current_price", 0))
+        else:
+            entry_price = 0
+
+        stop_valid = True
+        tp_valid = True
+        validation_warnings: list[str] = []
+
+        # P0-FIX (#11): validate stop_loss and take_profit distances
+        # stop_loss must be 0.5%-2.5% away from entry
+        MIN_STOP_PCT = 0.005   # 0.5%
+        MAX_STOP_PCT = 0.025  # 2.5%
+        MIN_RR_MULT  = 1.5    # TP must be >= 1.5x the stop distance
+
+        if stop_loss is not None and isinstance(stop_loss, (int, float)) and stop_loss > 0 and entry_price > 0:
+            if decision == "BUY":
+                stop_dist_pct = (entry_price - stop_loss) / entry_price
+            elif decision == "SELL":
+                stop_dist_pct = (stop_loss - entry_price) / entry_price
+            else:
+                stop_dist_pct = None
+
+            if stop_dist_pct is None or stop_dist_pct < MIN_STOP_PCT or stop_dist_pct > MAX_STOP_PCT:
+                stop_valid = False
+                validation_warnings.append(
+                    f"stop_loss {stop_loss} rejected: distance {stop_dist_pct*100:.2f}% "
+                    f"outside valid range [0.5%, 2.5%]"
+                )
+                stop_loss = None   # invalidate hallucinated value
+        else:
+            stop_valid = False
+            stop_loss = None
+
+        # take_profit must be at least MIN_RR_MULT x stop_distance away from entry
+        if (stop_valid and stop_loss is not None
+                and take_profit is not None and isinstance(take_profit, (int, float))
+                and take_profit > 0 and entry_price > 0):
+            if decision == "BUY":
+                tp_dist_pct        = (take_profit - entry_price) / entry_price
+                stop_dist_pct_abs  = (entry_price - stop_loss) / entry_price
+            elif decision == "SELL":
+                tp_dist_pct        = (entry_price - take_profit) / entry_price
+                stop_dist_pct_abs  = (stop_loss - entry_price) / entry_price
+            else:
+                tp_dist_pct = None
+
+            if tp_dist_pct is not None and stop_dist_pct_abs > 0:
+                rr = tp_dist_pct / stop_dist_pct_abs
+                if rr < MIN_RR_MULT:
+                    tp_valid = False
+                    validation_warnings.append(
+                        f"take_profit {take_profit} rejected: RR={rr:.2f} < minimum {MIN_RR_MULT}"
+                    )
+                    take_profit = None   # invalidate hallucinated value
+        else:
+            # No valid stop to compute RR against -- reject TP if stop was already invalid
+            if not stop_valid:
+                tp_valid = False
+                take_profit = None
+
+        # If stop or TP fails validation, degrade to NO_TRADE
+        if decision != "NO_TRADE" and (not stop_valid or not tp_valid):
+            return {
+                "decision": "NO_TRADE",
+                "symbol": parsed.get("symbol", "NONE"),
+                "risk_level": "HIGH",
+                "reason": (
+                    "LLM stop_loss/take_profit failed distance validation. "
+                    + " ".join(validation_warnings)[:200]
+                ),
+            }
+
+        # Attach validation warnings so callers can see what was corrected
+        if validation_warnings:
+            parsed["_validation_warnings"] = validation_warnings
 
         return parsed
     except (requests.exceptions.RequestException, json.JSONDecodeError, TypeError, ValueError) as e:
