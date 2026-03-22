@@ -189,30 +189,26 @@ def compute_kpis(events: List[dict], initial_equity: float = 10_000.0) -> dict:
 def build_trade_table(trades: List[dict]) -> pd.DataFrame:
     """
     Build a display table from the raw trades list.
-
-    Columns: #, Event, Timestamp, Anomaly, Direction, Entry, SL, TP,
-             RR, PnL ($), Result, Confidence
-    Plus hidden sort columns: _pnl_raw, _confidence_raw
+    Columns: #, Event, Timestamp, Anomaly, Direction, Entry($), SL($), TP($), RR, PnL($), Result, Confidence
+    All numeric columns are floats or ints for sorting; display columns are formatted strings.
     """
     rows = []
     for i, t in enumerate(trades):
-        rows.append(
-            {
-                "#": i + 1,
-                "Event": t.get("event_idx", "?"),
-                "Timestamp": t.get("timestamp", "?"),
-                "Anomaly": t.get("anomaly_type", "?"),
-                "Direction": t.get("direction", "?"),
-                "Entry": f"${t.get('entry_price', 0):,.2f}",
-                "SL": f"${t.get('stop_loss', 0):,.2f}",
-                "TP": f"${t.get('take_profit', 0):,.2f}",
-                "RR": f"{t.get('rr_ratio', 0):.2f}",
-                "PnL ($)": f"${t.get('pnl', 0):+.2f}",
-                "Result": t.get("trade_result", "HOLD"),
-                "Confidence": t.get("confidence", 0),
-                # Hidden raw values for sorting / charting
-                "_pnl_raw": t.get("pnl", 0),
-                "_confidence_raw": t.get("confidence", 0),
-            }
-        )
+        rows.append({
+            "#": i + 1,
+            "Event": t.get("event_idx", "?"),
+            "Timestamp": t.get("timestamp", "?"),
+            "Anomaly": t.get("anomaly_type", "?"),
+            "Direction": t.get("direction", "?"),
+            "Entry ($)": round(float(t.get("entry_price") or 0), 2),
+            "SL ($)": round(float(t.get("stop_loss") or 0), 2),
+            "TP ($)": round(float(t.get("take_profit") or 0), 2),
+            "RR": round(float(t.get("rr_ratio") or 0), 2),
+            "PnL ($)": round(float(t.get("pnl") or 0), 2),
+            "Result": t.get("trade_result", "HOLD"),
+            "Confidence": int(t.get("confidence") or 0),
+            # Hidden raw floats for sorting
+            "_pnl_raw": float(t.get("pnl") or 0),
+            "_confidence_raw": int(t.get("confidence") or 0),
+        })
     return pd.DataFrame(rows)

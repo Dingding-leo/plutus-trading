@@ -109,7 +109,9 @@ def build_equity_chart(equity_curve: List[dict]) -> go.Figure:
         showgrid=True,
         gridcolor="#1f2937",
         zeroline=False,
-        tickformat=",.0f",
+        tickformat="$,.0f",
+        autorange=True,
+        rangemode="tozero",
         row=1,
         col=1,
     )
@@ -346,9 +348,9 @@ def build_candlestick_chart(
     )
 
     fig.update_yaxes(
-        showgrid=True, gridcolor="#1f2937", zeroline=False, tickformat=".0f", row=1, col=1
+        showgrid=True, gridcolor="#1f2937", zeroline=False, tickformat=".0f", autorange=True, row=1, col=1
     )
-    fig.update_yaxes(showgrid=True, gridcolor="#1f2937", row=2, col=1)
+    fig.update_yaxes(showgrid=True, gridcolor="#1f2937", autorange=True, row=2, col=1)
     fig.update_xaxes(
         showgrid=True, gridcolor="#1f2937", rangeslider=dict(visible=False), row=1, col=1
     )
